@@ -5,3 +5,4 @@
 __pycache__
 __pycache__/
 *.pyc
+qdrant_local/
