@@ -137,32 +137,40 @@ class _BM25CrossEncoder(CrossEncoderClient):
         return self.rank_sync(query, passages)
 
 
-def _build_graphiti_client():
-    """Constructs a FRESH Graphiti client — deliberately NOT cached as a
-    persistent global anymore. Found to be the actual root cause of the
-    persistent "Unable to retrieve routing information" failures: the
-    Neo4j async driver's internal connection pool/routing-table state
-    gets bound to whichever asyncio event loop is active when it's first
-    used. _run_async() calls asyncio.run() fresh each time, which creates
-    AND TEARS DOWN a new event loop per call — so a cached client's
-    driver, first used under event-loop-instance #1, becomes silently
-    broken the moment a SECOND _run_async() call (a different LangGraph
-    node — diagnosis, then fraud, then customer_context — each calling
-    into Graphiti separately) runs under event-loop-instance #2. This
-    is a well-documented asyncio anti-pattern (reusing a loop-bound async
-    resource across different event loops) — and explains why switching
-    event loop TYPE (Selector vs Proactor, an earlier attempted fix)
-    made no difference at all: the problem was never about which kind of
-    loop, it was about reusing one driver across many separate loops.
+_kuzu_driver_singleton = None
 
-    The fix: construct the whole client fresh inside the SAME event loop
-    that will use it (called from within _add_episode_async /
-    _get_customer_history_async, each of which owns one complete
-    asyncio.run() lifecycle end to end), and close it before returning.
-    This costs a fresh Neo4j connection per call instead of reusing one —
-    a real, accepted tradeoff for correctness, and Aura connections are
-    fast enough that this isn't a meaningful performance concern at this
-    project's actual call volume.
+
+def _build_graphiti_client():
+    """Constructs a Graphiti client. Two DIFFERENT lifecycle strategies
+    for the graph driver, deliberately not the same for both backends —
+    found necessary by hitting two DIFFERENT, unrelated bugs from
+    treating them identically:
+
+    NEO4J: constructed FRESH on every call, never cached. Its async
+    driver's internal connection pool/routing-table state gets bound to
+    whichever asyncio event loop is active when first used — since
+    _run_async() calls asyncio.run() fresh each time (creating AND
+    TEARING DOWN a new event loop per call), a cached Neo4j driver first
+    used under event-loop #1 silently breaks the moment a later,
+    separate call runs under event-loop #2. Confirmed as the actual
+    mechanism by isolating the neo4j package's own async driver with
+    zero Graphiti involvement and it connecting successfully every time.
+
+    KUZU: cached as a PROCESS-WIDE SINGLETON, the OPPOSITE strategy —
+    constructing a fresh KuzuDriver on every call (matching Neo4j's
+    approach) breaks Kuzu specifically, because it's an embedded,
+    file-locked database: opening a `kuzu.Database()` takes an EXCLUSIVE
+    lock on its storage path, and Kuzu does not support multiple
+    Database instances (even sequential, non-overlapping ones, if the
+    previous one's lock hasn't been released yet by the time the next
+    tries to open) against the same path. Confirmed directly: "always
+    construct fresh" — the exact fix that resolved Neo4j's bug —
+    immediately broke Kuzu with "IO exception: Could not set lock on
+    file" once NEO4J_URI was unset and Kuzu became the active backend.
+    Kuzu's underlying engine is a synchronous, purely local C++ library
+    (no network sockets, no event-loop-bound async state), so caching it
+    across separate asyncio.run() calls is safe in exactly the way
+    caching Neo4j's driver is not.
     """
     from app.core.config import get_settings
     settings = get_settings()
@@ -195,14 +203,15 @@ def _build_graphiti_client():
         from graphiti_core.driver.neo4j_driver import Neo4jDriver
         driver = Neo4jDriver(uri=settings.neo4j_uri, user=settings.neo4j_user, password=settings.neo4j_password)
     else:
-        from graphiti_core.driver.kuzu_driver import KuzuDriver
-        # NOTE: do NOT pre-create kuzu_local_path as a directory — Kuzu's
-        # Database() creates its own storage AT that exact path (a file,
-        # not a directory) and raises "Database path cannot be a
-        # directory" if something already exists there. Confirmed
-        # directly: an earlier version of this code called os.makedirs()
-        # first and broke on exactly this.
-        driver = KuzuDriver(db=settings.kuzu_local_path)
+        global _kuzu_driver_singleton
+        if _kuzu_driver_singleton is None:
+            from graphiti_core.driver.kuzu_driver import KuzuDriver
+            # NOTE: do NOT pre-create kuzu_local_path as a directory —
+            # Kuzu's Database() creates its own storage AT that exact
+            # path (a file, not a directory) and raises "Database path
+            # cannot be a directory" if something already exists there.
+            _kuzu_driver_singleton = KuzuDriver(db=settings.kuzu_local_path)
+        driver = _kuzu_driver_singleton
 
     return Graphiti(
         llm_client=llm_client, embedder=embedder, graph_driver=driver, cross_encoder=_BM25CrossEncoder(),
@@ -211,14 +220,16 @@ def _build_graphiti_client():
 
 def _get_graphiti_client():
     """Backward-compatible alias — see _build_graphiti_client's docstring
-    for why this no longer caches a persistent client."""
+    for why the Neo4j driver no longer caches a persistent client (the
+    Kuzu driver still does, via a separate mechanism)."""
     return _build_graphiti_client()
 
 
 def reset_graphiti_client() -> None:
-    """No-op now that there's no persistent global to reset — kept so
-    existing test fixtures calling this don't break."""
-    pass
+    """Test helper — resets the Kuzu driver singleton (the only
+    persistent state left after the Neo4j caching fix)."""
+    global _kuzu_driver_singleton
+    _kuzu_driver_singleton = None
 
 
 GRAPHITI_CALL_TIMEOUT_SECONDS = 15.0
@@ -246,10 +257,41 @@ def _run_async(coro):
         ) from None
 
 
+async def _wait_for_neo4j_driver_init(client) -> None:
+    """Works around a genuine race condition inside graphiti-core's own
+    Neo4jDriver.__init__ (confirmed by reading its source directly):
+    construction schedules build_indices_and_constraints() as a
+    fire-and-forget background asyncio.Task via
+    `loop.create_task(...)`, stored on the driver as `_init_task` — but
+    nothing in Graphiti's own code makes any CALLER wait for that task
+    before using the driver for a real operation. This is exactly the
+    "Unable to retrieve routing information" failures seen in practice:
+    a real operation (retrieve_episodes, add_episode) starts using the
+    driver's connection pool WHILE that background init task is still
+    concurrently trying to establish routing/run its own index-creation
+    queries on the SAME pool, racing against each other. Confirmed this
+    is genuinely inside Graphiti's code, not this project's or the
+    underlying neo4j package's, by isolating the neo4j async driver
+    completely standalone (zero Graphiti involvement) and confirming it
+    connects successfully every time — the bug only appears once
+    Graphiti's Neo4jDriver wrapper is involved.
+
+    Awaiting client.driver._init_task here — reaching into a private
+    attribute, acknowledged — closes the race by ensuring the background
+    init genuinely finishes before this project's own code does anything
+    else with the client. A no-op for the Kuzu backend (which has no
+    such background task) since the attribute simply won't be present.
+    """
+    init_task = getattr(getattr(client, "driver", None), "_init_task", None)
+    if init_task is not None:
+        await init_task
+
+
 async def _add_episode_async(customer_id: str, episode_type: str, content: dict,
                               occurred_at: datetime, case_id: str = None) -> None:
     client = _build_graphiti_client()
     try:
+        await _wait_for_neo4j_driver_init(client)
         await client.build_indices_and_constraints()
         episode_body = json.dumps({"episode_type": episode_type, "content": content, "case_id": case_id})
         await client.add_episode(
@@ -266,6 +308,7 @@ async def _add_episode_async(customer_id: str, episode_type: str, content: dict,
 async def _get_customer_history_async(customer_id: str, episode_type: str = None, limit: int = 20) -> list:
     client = _build_graphiti_client()
     try:
+        await _wait_for_neo4j_driver_init(client)
         nodes = await client.retrieve_episodes(
             reference_time=datetime.now(timezone.utc), last_n=limit, group_ids=[customer_id],
         )

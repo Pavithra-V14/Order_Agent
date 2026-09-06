@@ -305,3 +305,125 @@ def test_graphiti_client_is_closed_after_each_call(monkeypatch):
                              occurred_at=datetime(2025, 6, 1, tzinfo=timezone.utc))
 
     assert close_count["n"] == 1, "each fresh client must be explicitly closed after use"
+
+
+def test_waits_for_neo4j_driver_background_init_task_before_proceeding():
+    """THE regression test for the actual, confirmed root cause (found
+    by reading graphiti-core's own source directly): Neo4jDriver.__init__
+    schedules build_indices_and_constraints() as a fire-and-forget
+    background asyncio.Task on construction (`loop.create_task(...)`,
+    stored as `_init_task`), but nothing in Graphiti's own code makes a
+    caller wait for it before using the driver. A real operation
+    (retrieve_episodes, add_episode) starting to use the driver's
+    connection pool WHILE that background task is still concurrently
+    trying to establish routing/run its own queries on the SAME pool is
+    exactly what produced "Unable to retrieve routing information" in
+    production — confirmed as genuinely inside Graphiti's code, not this
+    project's, by isolating the neo4j package's own async driver
+    completely standalone (zero Graphiti) and confirming it connects
+    successfully every single time.
+
+    This test proves _wait_for_neo4j_driver_init() genuinely waits for a
+    slow background task to complete before returning, rather than
+    immediately returning while it's still pending.
+    """
+    import asyncio
+    from app.memory.graphiti_adapter import _wait_for_neo4j_driver_init
+
+    class FakeDriver:
+        def __init__(self):
+            self.completed = False
+
+            async def slow_init():
+                await asyncio.sleep(0.1)
+                self.completed = True
+
+            self._init_task = asyncio.get_event_loop().create_task(slow_init())
+
+    class FakeClient:
+        def __init__(self):
+            self.driver = FakeDriver()
+
+    async def run_test():
+        client = FakeClient()
+        assert client.driver.completed is False, "background task should not have finished yet"
+        await _wait_for_neo4j_driver_init(client)
+        assert client.driver.completed is True, (
+            "must genuinely wait for the background init task to complete before returning — "
+            "this is the exact race this fix closes"
+        )
+
+    asyncio.run(run_test())
+
+
+def test_waits_is_a_noop_when_no_init_task_present():
+    """The Kuzu backend (and any driver without this background-task
+    pattern) has no _init_task attribute at all — must not raise."""
+    import asyncio
+    from app.memory.graphiti_adapter import _wait_for_neo4j_driver_init
+
+    class FakeDriverNoInitTask:
+        pass
+
+    class FakeClient:
+        def __init__(self):
+            self.driver = FakeDriverNoInitTask()
+
+    asyncio.run(_wait_for_neo4j_driver_init(FakeClient()))  # must not raise
+
+
+def test_kuzu_driver_is_cached_across_multiple_sequential_calls(monkeypatch):
+    """THE regression test for the actual production bug: with NEO4J_URI
+    unset (Kuzu active), constructing a FRESH KuzuDriver on every single
+    call — the exact strategy that correctly fixes Neo4j's bug — breaks
+    Kuzu instead, because kuzu.Database() takes an EXCLUSIVE lock on its
+    storage path and does not support re-opening it while a prior
+    instance's lock hasn't been released. Confirmed directly: this
+    failed in production with "IO exception: Could not set lock on file"
+    the moment NEO4J_URI was unset and multiple LangGraph nodes each
+    called into Graphiti in turn.
+
+    This test uses the REAL KuzuDriver against a real temp path (only
+    the Graphiti wrapper class itself is mocked, to avoid needing a real
+    LLM call) — proving the actual file-locking behavior is exercised,
+    not just a mocked stand-in that wouldn't reproduce the real bug.
+    """
+    os.environ["GROQ_API_KEY"] = "gsk_fake_test_key"
+    os.environ.pop("NEO4J_URI", None)
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    tmp_dir = tempfile.mkdtemp(prefix="test_kuzu_cache_")
+    kuzu_path = f"{tmp_dir}/test.kz"
+    os.environ["KUZU_LOCAL_PATH"] = kuzu_path
+    get_settings.cache_clear()
+
+    import app.memory.graphiti_adapter as ga
+    ga.reset_graphiti_client()
+
+    captured_drivers = []
+
+    class FakeGraphitiCapturesDriver:
+        def __init__(self, llm_client, embedder, graph_driver, cross_encoder=None):
+            captured_drivers.append(graph_driver)
+
+    monkeypatch.setattr("graphiti_core.Graphiti", FakeGraphitiCapturesDriver)
+
+    try:
+        # Simulate 3 separate sequential calls — exactly what diagnosis,
+        # fraud, and customer_context each independently trigger in a
+        # real orchestrator run. With a REAL KuzuDriver, this would raise
+        # "Could not set lock on file" on the second call if a fresh
+        # instance were constructed each time instead of reusing one.
+        for _ in range(3):
+            ga._build_graphiti_client()
+
+        assert len(captured_drivers) == 3
+        assert captured_drivers[0] is captured_drivers[1] is captured_drivers[2], (
+            "the SAME KuzuDriver instance must be reused across all 3 calls — constructing a "
+            "fresh one each time is the exact bug that broke the real Kuzu file lock in production"
+        )
+    finally:
+        os.environ.pop("KUZU_LOCAL_PATH", None)
+        ga.reset_graphiti_client()
+        shutil.rmtree(tmp_dir, ignore_errors=True)

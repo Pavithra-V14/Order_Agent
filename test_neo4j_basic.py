@@ -27,6 +27,36 @@ def test_normal():
         driver.close()
 
 
+async def test_async():
+    """
+    Tests ONLY the neo4j package's own ASYNC driver - zero Graphiti
+    involvement at all. This isolates one specific question: is the
+    sync-vs-async asymmetry (sync connects fine, async fails) a bug in
+    the `neo4j` package itself on this machine/environment, or is it
+    something specific to how Graphiti wraps/uses that driver?
+
+    If this ALSO fails the same way test_normal() succeeds: the bug is
+    in the neo4j async driver itself here (a real environment issue —
+    Python version, network stack, uv's packaging, something below
+    Graphiti entirely) — not something fixable in this project's
+    Graphiti integration code at all.
+
+    If this SUCCEEDS: the bug is specific to how Graphiti constructs or
+    uses its Neo4jDriver wrapper, not the underlying neo4j package —
+    narrows the next fix to Graphiti's own code, not this project's.
+    """
+    print("\n=== Async (neo4j package's own AsyncGraphDatabase, NO Graphiti) ===")
+    from neo4j import AsyncGraphDatabase
+    driver = AsyncGraphDatabase.driver(URI, auth=(USER, PASSWORD))
+    try:
+        await driver.verify_connectivity()
+        print("SUCCESS (async, no Graphiti)")
+    except Exception as e:
+        print(f"FAILED: {type(e).__name__}: {e}")
+    finally:
+        await driver.close()
+
+
 def test_insecure_diagnostic_only():
     """
     DIAGNOSTIC ONLY - never use this scheme in real code or leave it
@@ -67,5 +97,11 @@ def test_insecure_diagnostic_only():
 
 
 if __name__ == "__main__":
+    import asyncio
     test_normal()
-    test_insecure_diagnostic_only()
+    asyncio.run(test_async())
+    # test_insecure_diagnostic_only() is no longer needed — the sync test
+    # already succeeded with FULL certificate verification (no TLS
+    # interception), so that theory is already ruled out. Uncomment
+    # below only if you want to re-confirm it:
+    # test_insecure_diagnostic_only()
