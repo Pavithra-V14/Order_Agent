@@ -427,3 +427,78 @@ def test_kuzu_driver_is_cached_across_multiple_sequential_calls(monkeypatch):
         os.environ.pop("KUZU_LOCAL_PATH", None)
         ga.reset_graphiti_client()
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_kuzu_driver_construction_is_thread_safe_under_real_concurrency():
+    """THE regression test for why the previous fix (caching a Kuzu
+    singleton) still broke in production: the cache check was a plain
+    `if _kuzu_driver_singleton is None: construct()`, with no lock — a
+    classic check-then-act race. LangGraph runs diagnosis, fraud,
+    inventory, and customer_context IN PARALLEL via a thread pool
+    (confirmed directly from a real production traceback's
+    concurrent.futures.thread frame), so multiple threads genuinely call
+    _build_graphiti_client() at the same time. Two threads can both see
+    `is None` before either finishes constructing, and both proceed to
+    open their own kuzu.Database() on the identical path simultaneously —
+    reproducing "Could not set lock on file" from real concurrency, not
+    just sequential calls (which is exactly why the earlier
+    sequential-only test above did not catch this).
+
+    This test uses REAL threads and the REAL KuzuDriver/kuzu.Database
+    class (only the Graphiti wrapper itself is mocked, to avoid a real
+    LLM call) — genuinely exercising the file-lock race, not simulating
+    it. Before the threading.Lock() fix, this test reliably fails with
+    the exact "Could not set lock on file" RuntimeError when run
+    multiple times; with the fix, it passes reliably.
+    """
+    import threading
+
+    os.environ["GROQ_API_KEY"] = "gsk_fake_test_key"
+    os.environ.pop("NEO4J_URI", None)
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    tmp_dir = tempfile.mkdtemp(prefix="test_kuzu_concurrent_")
+    kuzu_path = f"{tmp_dir}/test.kz"
+    os.environ["KUZU_LOCAL_PATH"] = kuzu_path
+    get_settings.cache_clear()
+
+    import app.memory.graphiti_adapter as ga
+    ga.reset_graphiti_client()
+
+    errors = []
+    constructed_drivers = []
+    lock = threading.Lock()
+
+    def worker():
+        try:
+            driver = ga._get_or_create_kuzu_driver(kuzu_path)
+            with lock:
+                constructed_drivers.append(driver)
+        except Exception as e:
+            with lock:
+                errors.append(e)
+
+    try:
+        # 8 threads hitting the SAME construction path at the same time —
+        # deliberately more than LangGraph's actual 4 parallel nodes, to
+        # stress the race harder than the minimum needed to reproduce it.
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert not errors, (
+            f"Expected zero errors from concurrent construction, got: {errors} — "
+            f"a 'Could not set lock on file' here means the race is NOT actually closed"
+        )
+        assert len(constructed_drivers) == 8
+        assert len(set(id(d) for d in constructed_drivers)) == 1, (
+            "all 8 threads must receive the exact SAME driver instance — any thread getting "
+            "a DIFFERENT instance means it won the race and opened a second, conflicting lock"
+        )
+    finally:
+        os.environ.pop("KUZU_LOCAL_PATH", None)
+        ga.reset_graphiti_client()
+        shutil.rmtree(tmp_dir, ignore_errors=True)

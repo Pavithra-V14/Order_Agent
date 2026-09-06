@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from datetime import datetime, timezone
 
 from graphiti_core.embedder.client import EmbedderClient
@@ -138,6 +139,7 @@ class _BM25CrossEncoder(CrossEncoderClient):
 
 
 _kuzu_driver_singleton = None
+_kuzu_driver_lock = threading.Lock()
 
 
 def _build_graphiti_client():
@@ -203,19 +205,45 @@ def _build_graphiti_client():
         from graphiti_core.driver.neo4j_driver import Neo4jDriver
         driver = Neo4jDriver(uri=settings.neo4j_uri, user=settings.neo4j_user, password=settings.neo4j_password)
     else:
-        global _kuzu_driver_singleton
+        driver = _get_or_create_kuzu_driver(settings.kuzu_local_path)
+
+    return Graphiti(
+        llm_client=llm_client, embedder=embedder, graph_driver=driver, cross_encoder=_BM25CrossEncoder(),
+    )
+
+
+def _get_or_create_kuzu_driver(kuzu_local_path: str):
+    """Thread-safe singleton construction — the actual bug that broke
+    the previous fix in production. LangGraph runs diagnosis, fraud,
+    inventory, and customer_context IN PARALLEL via a thread pool
+    (confirmed from the real traceback's concurrent.futures.thread
+    frame), so multiple threads can call _build_graphiti_client()
+    genuinely concurrently. The earlier fix's plain
+    `if _kuzu_driver_singleton is None: construct()` check has a classic
+    check-then-act race: two threads can both see None before either has
+    finished constructing, and both proceed to open their own
+    kuzu.Database() on the identical path at the same time — the exact
+    "Could not set lock on file" failure, just from real thread
+    concurrency rather than sequential calls (which is why the earlier
+    sequential-only regression test didn't catch this). Fixed with the
+    standard double-checked-locking pattern: re-check inside the lock
+    before constructing, so only ever exactly one thread wins the race.
+    """
+    global _kuzu_driver_singleton
+    if _kuzu_driver_singleton is not None:
+        return _kuzu_driver_singleton
+
+    with _kuzu_driver_lock:
+        # Re-check after acquiring the lock — another thread may have
+        # already constructed it while this one was waiting.
         if _kuzu_driver_singleton is None:
             from graphiti_core.driver.kuzu_driver import KuzuDriver
             # NOTE: do NOT pre-create kuzu_local_path as a directory —
             # Kuzu's Database() creates its own storage AT that exact
             # path (a file, not a directory) and raises "Database path
             # cannot be a directory" if something already exists there.
-            _kuzu_driver_singleton = KuzuDriver(db=settings.kuzu_local_path)
-        driver = _kuzu_driver_singleton
-
-    return Graphiti(
-        llm_client=llm_client, embedder=embedder, graph_driver=driver, cross_encoder=_BM25CrossEncoder(),
-    )
+            _kuzu_driver_singleton = KuzuDriver(db=kuzu_local_path)
+        return _kuzu_driver_singleton
 
 
 def _get_graphiti_client():
