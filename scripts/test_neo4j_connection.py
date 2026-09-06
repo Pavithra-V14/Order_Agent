@@ -53,36 +53,49 @@ def main():
 
         # The neo4j driver wraps the REAL underlying error inside a
         # generic ServiceUnavailable/"Unable to retrieve routing
-        # information" message — that generic wrapper looks IDENTICAL
-        # whether the actual cause is a blocked port or a TLS
-        # interception, so printing only the top-level exception (as an
-        # earlier version of this script did) hides the one detail that
-        # actually tells them apart. Walking __cause__ surfaces it.
-        full_chain = []
-        cause = e
-        while cause is not None:
-            full_chain.append(f"{type(cause).__name__}: {cause}")
-            cause = cause.__cause__
-        print("Full exception chain (root cause is usually the LAST line):")
-        for i, line in enumerate(full_chain):
-            print(f"  [{i}] {line}")
+        # information" message, which itself often wraps an
+        # ExceptionGroup — and ExceptionGroup does NOT chain via
+        # __cause__ the way a normal "raise X from Y" does; its
+        # sub-exceptions live in a separate `.exceptions` tuple.
+        # Confirmed as a real bug in an earlier version of this exact
+        # script: walking __cause__ alone stopped at the ExceptionGroup
+        # wrapper and never reached the actual SSL/network error nested
+        # inside it, producing a misleading "could not reach Aura at all"
+        # conclusion when the real cause (visible in the full traceback
+        # elsewhere) was an SSL certificate error the whole time.
+        def _unpack(exc, depth=0):
+            lines = [(depth, f"{type(exc).__name__}: {exc}")]
+            if exc.__cause__ is not None:
+                lines += _unpack(exc.__cause__, depth + 1)
+            if hasattr(exc, "exceptions"):  # ExceptionGroup / BaseExceptionGroup
+                for sub in exc.exceptions:
+                    lines += _unpack(sub, depth + 1)
+            return lines
+
+        full_chain = _unpack(e)
+        print("Full exception chain (root cause is usually the DEEPEST/most-indented line):")
+        for depth, line in full_chain:
+            print(f"  {'  ' * depth}[{depth}] {line}")
         print()
 
-        full_text = " ".join(full_chain)
+        full_text = " ".join(line for _, line in full_chain)
         if "CERTIFICATE_VERIFY_FAILED" in full_text or "self-signed" in full_text:
             print("Root cause: TLS interception (VPN/antivirus/corporate proxy).")
+            print("A self-signed certificate showed up where Aura's real, CA-signed")
+            print("certificate should be — something between your machine and Aura is")
+            print("intercepting the TLS handshake and presenting its own certificate.")
             print("  1. Disable VPN/corporate proxy temporarily and re-run this script.")
             print("  2. Check antivirus 'HTTPS scanning'/'SSL inspection' - disable, re-test.")
-            print("  3. Try from a different network entirely (e.g. mobile hotspot).")
+            print("     (Kaspersky, ESET, and some Windows security suites do this by default.)")
+            print("  3. Try from a different network entirely (e.g. mobile hotspot) - if it")
+            print("     works there, the problem is specific to your current network/software.")
             print("  4. Confirm NEO4J_URI starts with 'neo4j+s://' exactly, no typos.")
         elif "routing information" in full_text or "ServiceUnavailable" in full_text:
-            print("Root cause: could not reach Aura at all (no TLS handshake attempted,")
-            print("per the chain above having no certificate-related line). Try:")
+            print("Root cause: could not reach Aura at all (no certificate-related line")
+            print("found even after unpacking the full exception chain). Try:")
             print("  1. A different network (mobile hotspot) - many office/ISP networks")
             print("     block port 7687 (Neo4j's Bolt port) outright.")
-            print("  2. Confirm the instance is actually RUNNING in the Aura console")
-            print("     (not paused - Aura free-tier instances auto-pause after inactivity).")
-            print("  3. Double check NEO4J_URI has no typos (copy-paste directly from Aura).")
+            print("  2. Double check NEO4J_URI has no typos (copy-paste directly from Aura).")
         sys.exit(1)
 
 

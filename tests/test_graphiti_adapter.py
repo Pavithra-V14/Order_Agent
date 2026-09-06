@@ -211,3 +211,97 @@ def test_episodic_log_episode_delegates_to_graphiti_when_available(monkeypatch):
     assert calls["called"] is True
     assert calls["customer_id"] == "CUST-GRAPHITI-1"
     assert result["customer_id"] == "CUST-GRAPHITI-1"
+
+
+def test_graphiti_client_is_not_reused_across_separate_asyncio_run_calls(monkeypatch):
+    """THE regression test for the actual root cause found in production:
+    a persistent, globally-cached Graphiti client whose underlying async
+    Neo4j driver gets bound to whichever asyncio event loop is active
+    when first used. Since _run_async() calls asyncio.run() fresh each
+    time (creating AND TEARING DOWN a new event loop per call), reusing
+    one cached client across multiple SEPARATE _run_async() invocations —
+    exactly what happens in a real orchestrator run, where diagnosis,
+    fraud, and customer_context nodes each independently call into
+    Graphiti — broke with "Unable to retrieve routing information" on
+    the second and later calls, regardless of event loop TYPE (an
+    earlier, incorrect fix attempt tried swapping Windows event loop
+    implementations and made no difference, confirming the real bug was
+    never about loop type).
+
+    This test proves the fix: _build_graphiti_client() is called fresh
+    inside EACH separate asyncio.run() invocation (never cached), so
+    multiple sequential calls — simulating diagnosis -> fraud ->
+    customer_context each calling into Graphiti in turn — must all
+    succeed, using a genuinely NEW client instance each time.
+    """
+    os.environ["GROQ_API_KEY"] = "gsk_fake_test_key"
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    construction_count = {"n": 0}
+
+    class FakeGraphitiTracksLoop:
+        def __init__(self, llm_client, embedder, graph_driver, cross_encoder=None):
+            construction_count["n"] += 1
+
+        async def build_indices_and_constraints(self):
+            pass
+
+        async def add_episode(self, **kwargs):
+            pass
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("graphiti_core.Graphiti", FakeGraphitiTracksLoop)
+
+    import app.memory.graphiti_adapter as ga
+    from datetime import datetime, timezone
+
+    # Simulate 3 separate agent nodes each independently calling into
+    # Graphiti - exactly the real orchestrator's call pattern.
+    for i in range(3):
+        ga.log_episode_graphiti("CUST-LOOP-TEST", "case_resolved", {"n": i},
+                                 occurred_at=datetime(2025, 6, 1, tzinfo=timezone.utc))
+
+    assert construction_count["n"] == 3, (
+        "each call must construct a genuinely fresh client, never reuse one across separate "
+        "asyncio.run() invocations — reusing one is the exact bug this test guards against, since "
+        "a cached client's driver gets bound to whichever event loop was active at construction, "
+        "and asyncio.run() tears down and recreates a new loop on every single call"
+    )
+
+
+def test_graphiti_client_is_closed_after_each_call(monkeypatch):
+    """The other half of correct lifecycle management: since the client
+    is no longer a persistent cached singleton, each fresh instance must
+    be explicitly closed after use, or connections leak across the many
+    short-lived clients this design now creates."""
+    os.environ["GROQ_API_KEY"] = "gsk_fake_test_key"
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    close_count = {"n": 0}
+
+    class FakeGraphitiTracksClose:
+        def __init__(self, llm_client, embedder, graph_driver, cross_encoder=None):
+            pass
+
+        async def build_indices_and_constraints(self):
+            pass
+
+        async def add_episode(self, **kwargs):
+            pass
+
+        async def close(self):
+            close_count["n"] += 1
+
+    monkeypatch.setattr("graphiti_core.Graphiti", FakeGraphitiTracksClose)
+
+    import app.memory.graphiti_adapter as ga
+    from datetime import datetime, timezone
+
+    ga.log_episode_graphiti("CUST-CLOSE-TEST", "case_resolved", {},
+                             occurred_at=datetime(2025, 6, 1, tzinfo=timezone.utc))
+
+    assert close_count["n"] == 1, "each fresh client must be explicitly closed after use"

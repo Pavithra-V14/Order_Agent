@@ -267,7 +267,37 @@ class ThresholdOverrideRecord(Base):
 # --- Engine / session ---
 settings = get_settings()
 _connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
-engine = create_engine(settings.database_url, connect_args=_connect_args)
+engine = create_engine(
+    settings.database_url,
+    connect_args=_connect_args,
+    # pool_pre_ping + pool_recycle: found necessary in production against
+    # a real cloud Postgres (Neon/Supabase). Managed/serverless Postgres
+    # providers aggressively close idle connections server-side to save
+    # resources — SQLAlchemy's default connection pool has no way to
+    # know a pooled connection has gone stale until it actually tries to
+    # use it, which surfaces as "psycopg2.OperationalError: server closed
+    # the connection unexpectedly" on whatever query happens to run
+    # first after an idle period. This hit in exactly that shape: an RQ
+    # worker sitting idle waiting for jobs, then failing on the very
+    # first query once a job finally arrived.
+    #   - pool_pre_ping=True: runs a lightweight "is this connection
+    #     still alive" check before handing a pooled connection to a
+    #     real query, transparently reconnecting if it's dead. Small
+    #     latency cost per checkout, in exchange for never seeing this
+    #     error again — the standard, documented fix for this exact
+    #     class of issue with any serverless/managed Postgres.
+    #   - pool_recycle=280: proactively discards and replaces a pooled
+    #     connection older than this many seconds, rather than relying
+    #     solely on pre_ping to catch every case. 280s is comfortably
+    #     under most managed providers' typical idle-connection-close
+    #     windows (often 5 minutes / 300s) — recycling just under that
+    #     avoids racing the server's own timeout.
+    # Harmless no-ops for local SQLite (no idle-connection-close
+    # behavior to protect against there), so applied unconditionally
+    # rather than branching on dialect.
+    pool_pre_ping=True,
+    pool_recycle=280,
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 

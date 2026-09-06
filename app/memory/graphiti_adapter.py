@@ -137,15 +137,33 @@ class _BM25CrossEncoder(CrossEncoderClient):
         return self.rank_sync(query, passages)
 
 
-_graphiti_client = None
+def _build_graphiti_client():
+    """Constructs a FRESH Graphiti client — deliberately NOT cached as a
+    persistent global anymore. Found to be the actual root cause of the
+    persistent "Unable to retrieve routing information" failures: the
+    Neo4j async driver's internal connection pool/routing-table state
+    gets bound to whichever asyncio event loop is active when it's first
+    used. _run_async() calls asyncio.run() fresh each time, which creates
+    AND TEARS DOWN a new event loop per call — so a cached client's
+    driver, first used under event-loop-instance #1, becomes silently
+    broken the moment a SECOND _run_async() call (a different LangGraph
+    node — diagnosis, then fraud, then customer_context — each calling
+    into Graphiti separately) runs under event-loop-instance #2. This
+    is a well-documented asyncio anti-pattern (reusing a loop-bound async
+    resource across different event loops) — and explains why switching
+    event loop TYPE (Selector vs Proactor, an earlier attempted fix)
+    made no difference at all: the problem was never about which kind of
+    loop, it was about reusing one driver across many separate loops.
 
-
-def _get_graphiti_client():
-    """Constructs (once) and returns the process-wide Graphiti client."""
-    global _graphiti_client
-    if _graphiti_client is not None:
-        return _graphiti_client
-
+    The fix: construct the whole client fresh inside the SAME event loop
+    that will use it (called from within _add_episode_async /
+    _get_customer_history_async, each of which owns one complete
+    asyncio.run() lifecycle end to end), and close it before returning.
+    This costs a fresh Neo4j connection per call instead of reusing one —
+    a real, accepted tradeoff for correctness, and Aura connections are
+    fast enough that this isn't a meaningful performance concern at this
+    project's actual call volume.
+    """
     from app.core.config import get_settings
     settings = get_settings()
     if not settings.groq_api_key:
@@ -186,16 +204,21 @@ def _get_graphiti_client():
         # first and broke on exactly this.
         driver = KuzuDriver(db=settings.kuzu_local_path)
 
-    _graphiti_client = Graphiti(
+    return Graphiti(
         llm_client=llm_client, embedder=embedder, graph_driver=driver, cross_encoder=_BM25CrossEncoder(),
     )
-    return _graphiti_client
+
+
+def _get_graphiti_client():
+    """Backward-compatible alias — see _build_graphiti_client's docstring
+    for why this no longer caches a persistent client."""
+    return _build_graphiti_client()
 
 
 def reset_graphiti_client() -> None:
-    """Test helper - forces reconstruction on next use."""
-    global _graphiti_client
-    _graphiti_client = None
+    """No-op now that there's no persistent global to reset — kept so
+    existing test fixtures calling this don't break."""
+    pass
 
 
 GRAPHITI_CALL_TIMEOUT_SECONDS = 15.0
@@ -206,16 +229,11 @@ def _run_async(coro):
     codebase. Safe here since nothing in this project runs its own event
     loop that this would conflict with.
 
-    Wrapped in a bounded timeout — found necessary directly: a Neo4j
-    Aura connectivity problem (bad network route, SSL interception,
-    wrong firewall rule) caused the underlying neo4j driver's own
-    retry/backoff policy to retry for MINUTES with escalating delays
-    (up to 18+ seconds between attempts) before finally raising,
-    spamming stdout with hundreds of "Unable to retrieve routing
-    information" lines the whole time. That's true regardless of WHICH
-    external dependency stalls (Neo4j or Groq) — nothing in this bridge
-    should be allowed to hang unbounded, so every call now fails fast
-    and clearly instead.
+    Wrapped in a bounded timeout — nothing in this bridge should be
+    allowed to hang unbounded regardless of which external dependency
+    (Neo4j or Groq) stalls; an earlier version of this function let a
+    Neo4j connectivity problem retry for MINUTES with escalating delays
+    before finally raising.
     """
     try:
         return asyncio.run(asyncio.wait_for(coro, timeout=GRAPHITI_CALL_TIMEOUT_SECONDS))
@@ -230,23 +248,29 @@ def _run_async(coro):
 
 async def _add_episode_async(customer_id: str, episode_type: str, content: dict,
                               occurred_at: datetime, case_id: str = None) -> None:
-    client = _get_graphiti_client()
-    await client.build_indices_and_constraints()
-    episode_body = json.dumps({"episode_type": episode_type, "content": content, "case_id": case_id})
-    await client.add_episode(
-        name=episode_type,
-        episode_body=episode_body,
-        source_description=f"case:{case_id}" if case_id else "system",
-        reference_time=occurred_at,
-        group_id=customer_id,
-    )
+    client = _build_graphiti_client()
+    try:
+        await client.build_indices_and_constraints()
+        episode_body = json.dumps({"episode_type": episode_type, "content": content, "case_id": case_id})
+        await client.add_episode(
+            name=episode_type,
+            episode_body=episode_body,
+            source_description=f"case:{case_id}" if case_id else "system",
+            reference_time=occurred_at,
+            group_id=customer_id,
+        )
+    finally:
+        await client.close()
 
 
 async def _get_customer_history_async(customer_id: str, episode_type: str = None, limit: int = 20) -> list:
-    client = _get_graphiti_client()
-    nodes = await client.retrieve_episodes(
-        reference_time=datetime.now(timezone.utc), last_n=limit, group_ids=[customer_id],
-    )
+    client = _build_graphiti_client()
+    try:
+        nodes = await client.retrieve_episodes(
+            reference_time=datetime.now(timezone.utc), last_n=limit, group_ids=[customer_id],
+        )
+    finally:
+        await client.close()
     results = []
     for node in nodes:
         try:
