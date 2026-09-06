@@ -53,7 +53,19 @@ def record_span(
     metadata: dict = None,
     parent_span_id: str = None,
 ) -> TraceSpanRecord:
-    """Records one span. PII-redacts input/output before persist."""
+    """Records one span. PII-redacts input/output before persist.
+
+    Dual-writes to Langfuse Cloud when configured (LANGFUSE_PUBLIC_KEY /
+    LANGFUSE_SECRET_KEY + TRACING_ENABLED=true) — SQL remains the primary
+    store this project's own metrics (app/core/metrics.py, including the
+    RAG groundedness computation) query directly, since that needs
+    structured SQL querying Langfuse's hosted UI doesn't expose an API
+    for; Langfuse Cloud is an ADDITIONAL sink giving a real hosted trace
+    UI on top of the same data. A Langfuse failure (network, bad
+    credentials) is caught and logged, never allowed to break the
+    business logic that's actually being traced — observability must not
+    become a new failure mode for the system it's observing.
+    """
     span = TraceSpanRecord(
         trace_id=trace_id,
         parent_span_id=parent_span_id,
@@ -64,7 +76,58 @@ def record_span(
     )
     db.add(span)
     db.commit()
+
+    _push_to_langfuse(trace_id, agent_or_tool_name, span.input, span.output, span.span_metadata, parent_span_id)
+
     return span
+
+
+def _push_to_langfuse(trace_id: str, name: str, input_data: dict, output_data: dict,
+                       metadata: dict, parent_span_id: str = None) -> None:
+    from app.core.config import get_settings
+    settings = get_settings()
+    if not (settings.tracing_enabled and settings.langfuse_public_key and settings.langfuse_secret_key):
+        return
+
+    try:
+        client = _get_langfuse_client()
+        langfuse_trace_id = client.create_trace_id(seed=trace_id)
+        trace_context = {"trace_id": langfuse_trace_id}
+        if parent_span_id:
+            trace_context["parent_span_id"] = parent_span_id
+        span = client.start_observation(
+            trace_context=trace_context, name=name,
+            input=input_data, output=output_data, metadata=metadata,
+        )
+        span.end()
+    except Exception as e:
+        # Never let an observability-layer failure break the traced
+        # operation itself — logged, not raised.
+        import logging
+        logging.getLogger("tracing").warning("Langfuse push failed (non-fatal): %s", e)
+
+
+_langfuse_client = None
+
+
+def _get_langfuse_client():
+    global _langfuse_client
+    if _langfuse_client is None:
+        from langfuse import Langfuse
+        from app.core.config import get_settings
+        settings = get_settings()
+        _langfuse_client = Langfuse(
+            public_key=settings.langfuse_public_key,
+            secret_key=settings.langfuse_secret_key,
+            host=settings.langfuse_host,
+        )
+    return _langfuse_client
+
+
+def reset_langfuse_client() -> None:
+    """Test helper."""
+    global _langfuse_client
+    _langfuse_client = None
 
 
 @dataclass

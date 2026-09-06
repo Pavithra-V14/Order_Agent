@@ -12,12 +12,9 @@ import pytest
 TEST_QDRANT_PATH = "data/qdrant_local_test_phase10"
 TEST_REINDEX_STATE = "data/reindex_state_test_phase10.json"
 
-
 @pytest.fixture
 def isolated_env():
-    tmp_db = os.path.join(tempfile.gettempdir(), "test_phase10.db")
-    if os.path.exists(tmp_db):
-        os.remove(tmp_db)
+    tmp_db = os.path.join(tempfile.gettempdir(), f"test_phase10_{os.getpid()}_{id(object())}.db")
     os.environ["DATABASE_URL"] = f"sqlite:///{tmp_db}"
     os.environ["QDRANT_LOCAL_PATH"] = TEST_QDRANT_PATH
     if os.path.exists(TEST_QDRANT_PATH):
@@ -53,9 +50,15 @@ def isolated_env():
         shutil.rmtree(TEST_QDRANT_PATH)
     if os.path.exists(TEST_REINDEX_STATE):
         os.remove(TEST_REINDEX_STATE)
-    if os.path.exists(tmp_db):
-        os.remove(tmp_db)
+    try:
 
+        if os.path.exists(tmp_db):
+
+            os.remove(tmp_db)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
 def test_groundedness_after_temporal_correctness_case(isolated_env):
     """THE Phase 10 DoD test."""
@@ -104,7 +107,6 @@ def test_groundedness_after_temporal_correctness_case(isolated_env):
     assert "resolution_decision" in span_names
     db.close()
 
-
 def test_groundedness_flags_a_hallucinated_citation(isolated_env):
     from app.rag.traced_retrieval import traced_hybrid_search
     from app.agents.resolution_policy_workflow import run_resolution_policy_workflow
@@ -133,7 +135,6 @@ def test_groundedness_flags_a_hallucinated_citation(isolated_env):
     assert case_entry["grounded"] is False
     assert rag_metrics["groundedness_score"] == 0.0
     db.close()
-
 
 def test_metrics_endpoints_via_api(isolated_env):
     from fastapi.testclient import TestClient
@@ -166,7 +167,6 @@ def test_metrics_endpoints_via_api(isolated_env):
         resp3 = client.get("/api/v1/metrics/not_a_real_scope")
         assert resp3.status_code == 404
 
-
 def test_pii_redacted_before_persist(isolated_env):
     from app.core.tracing import record_span, get_trace
 
@@ -180,7 +180,6 @@ def test_pii_redacted_before_persist(isolated_env):
     assert "jane.doe@example.com" not in str(trace)
     assert "REDACTED_EMAIL" in str(trace)
     db.close()
-
 
 def test_circuit_breaker_trip_creates_an_alert(isolated_env):
     from app.tools.payment import get_payment_gateway, reset_fake_gateway
@@ -206,7 +205,6 @@ def test_circuit_breaker_trip_creates_an_alert(isolated_env):
     alerts = get_recent_alerts(db, event_type="circuit_breaker_trip")
     assert len(alerts) >= 1
     db.close()
-
 
 def test_tier1_block_creates_an_alert(isolated_env):
     from app.agents.resolution_policy_workflow import run_resolution_policy_workflow

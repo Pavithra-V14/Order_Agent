@@ -9,12 +9,9 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-
 @pytest.fixture
 def client_and_db():
-    tmp_db = os.path.join(tempfile.gettempdir(), "test_phase12.db")
-    if os.path.exists(tmp_db):
-        os.remove(tmp_db)
+    tmp_db = os.path.join(tempfile.gettempdir(), f"test_phase12_{os.getpid()}_{id(object())}.db")
     os.environ["DATABASE_URL"] = f"sqlite:///{tmp_db}"
 
     from app.core.config import get_settings
@@ -41,9 +38,15 @@ def client_and_db():
     with TestClient(main_module.app) as client:
         yield client, db_module
 
-    if os.path.exists(tmp_db):
-        os.remove(tmp_db)
+    try:
 
+        if os.path.exists(tmp_db):
+
+            os.remove(tmp_db)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
 def test_openapi_schema_lists_every_architecture_doc_endpoint(client_and_db):
     """THE Phase 12 DoD test."""
@@ -65,7 +68,6 @@ def test_openapi_schema_lists_every_architecture_doc_endpoint(client_and_db):
 
     docs_resp = client.get("/docs")
     assert docs_resp.status_code == 200
-
 
 def test_webhook_acks_fast_and_processes_async(client_and_db):
     """Proves the ack-fast contract: the POST returns in well under 100ms,
@@ -103,7 +105,6 @@ def test_webhook_acks_fast_and_processes_async(client_and_db):
     cases_resp = client.get("/api/v1/cases")
     order_ids = [c["order_id"] for c in cases_resp.json()]
     assert "ORD-P12-1" in order_ids
-
 
 def test_escalation_decision_approve_flow(client_and_db):
     """Full loop: seed an escalated case with a proposed resolution,
@@ -147,7 +148,6 @@ def test_escalation_decision_approve_flow(client_and_db):
     assert updated_case.state == CaseState.RESOLVED
     db2.close()
 
-
 def test_escalation_list_sorted_by_priority(client_and_db):
     client, db_module = client_and_db
     from app.core.db import SessionLocal, ExceptionCase, CaseState
@@ -169,7 +169,6 @@ def test_escalation_list_sorted_by_priority(client_and_db):
     results = resp.json()
     assert results[0]["case_id"] == "case-fraud", "fraud-flagged case must be first despite lower amount"
 
-
 def test_policy_upload_never_overwrites(client_and_db):
     client, _ = client_and_db
 
@@ -188,7 +187,6 @@ def test_policy_upload_never_overwrites(client_and_db):
     if os.path.exists(upload_path):
         os.remove(upload_path)
 
-
 def test_reopen_requires_resolved_state(client_and_db):
     client, db_module = client_and_db
     from app.core.db import SessionLocal, ExceptionCase, CaseState
@@ -201,7 +199,6 @@ def test_reopen_requires_resolved_state(client_and_db):
 
     resp = client.post("/api/v1/cases/case-reopen-1/reopen")
     assert resp.status_code == 400, "a non-resolved case should not be reopenable"
-
 
 def test_reopen_resolved_case_preserves_audit_trail(client_and_db):
     client, db_module = client_and_db

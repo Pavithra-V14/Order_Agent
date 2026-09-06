@@ -11,12 +11,9 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-
 @pytest.fixture
 def client_and_db():
-    tmp_db = os.path.join(tempfile.gettempdir(), "test_phase13.db")
-    if os.path.exists(tmp_db):
-        os.remove(tmp_db)
+    tmp_db = os.path.join(tempfile.gettempdir(), f"test_phase13_{os.getpid()}_{id(object())}.db")
     os.environ["DATABASE_URL"] = f"sqlite:///{tmp_db}"
 
     from app.core.config import get_settings
@@ -43,9 +40,15 @@ def client_and_db():
     with TestClient(main_module.app) as client:
         yield client, db_module
 
-    if os.path.exists(tmp_db):
-        os.remove(tmp_db)
+    try:
 
+        if os.path.exists(tmp_db):
+
+            os.remove(tmp_db)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
 def test_all_eight_pages_render(client_and_db):
     """Every page from architecture doc 8.3 returns 200 and real HTML."""
@@ -66,7 +69,6 @@ def test_all_eight_pages_render(client_and_db):
     js = client.get("/static/app.js")
     assert css.status_code == 200 and len(css.text) > 500
     assert js.status_code == 200 and len(js.text) > 500
-
 
 def test_full_walkthrough_webhook_to_resolved_to_audit_log(client_and_db):
     """THE Phase 13 DoD test - driven through the exact HTTP calls each
@@ -131,7 +133,6 @@ def test_full_walkthrough_webhook_to_resolved_to_audit_log(client_and_db):
     assert "state_transition" in actions
     human_decision_entry = next(a for a in audit if a["action"] == "human_decision")
     assert human_decision_entry["actor"] == "human:walkthrough@test.com"
-
 
 def test_threshold_config_page_data_reflects_pending_vs_active(client_and_db):
     """Confirms the Threshold Config page's two data sources (pending

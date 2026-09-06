@@ -11,7 +11,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.golden_set import run_golden_set, ALL_SCENARIOS
 
-
 def test_golden_set_all_scenarios_pass():
     """The pre-deployment gate itself: every golden-set scenario must
     pass before anything ships."""
@@ -19,7 +18,6 @@ def test_golden_set_all_scenarios_pass():
     failed = [r for r in results if not r.passed]
     assert not failed, f"Golden set failures: {[(r.name, r.detail) for r in failed]}"
     assert len(results) == len(ALL_SCENARIOS) == 8
-
 
 def test_golden_set_includes_the_three_mandatory_scenarios():
     """Per the build checklist's Phase 15 DoD: the golden set must include
@@ -33,7 +31,6 @@ def test_golden_set_includes_the_three_mandatory_scenarios():
     }
     missing = required - scenario_names
     assert not missing, f"Golden set is missing required scenarios: {missing}"
-
 
 def test_golden_set_is_deterministic_across_three_runs():
     """Per the checklist: 'Run the golden set 3x unchanged to establish

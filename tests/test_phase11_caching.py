@@ -8,12 +8,9 @@ import tempfile
 
 import pytest
 
-
 @pytest.fixture(autouse=True)
 def isolated_db():
-    tmp_path = os.path.join(tempfile.gettempdir(), "test_phase11.db")
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    tmp_path = os.path.join(tempfile.gettempdir(), f"test_phase11_{os.getpid()}_{id(object())}.db")
     os.environ["DATABASE_URL"] = f"sqlite:///{tmp_path}"
 
     from app.core.config import get_settings
@@ -26,9 +23,15 @@ def isolated_db():
 
     yield db_module
 
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    try:
 
+        if os.path.exists(tmp_path):
+
+            os.remove(tmp_path)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
 @pytest.fixture(autouse=True)
 def reset_caches():
@@ -37,7 +40,6 @@ def reset_caches():
     reset_all_caches()
     reset_fake_carrier()
     yield
-
 
 def test_webhook_invalidation_reflects_new_stock_immediately(isolated_db):
     """The core scenario: diagnosis reads stock (gets cached), a webhook
@@ -61,7 +63,6 @@ def test_webhook_invalidation_reflects_new_stock_immediately(isolated_db):
         f"got {second_read[0]['sellable_qty']} - stale cache was served instead"
     )
     db.close()
-
 
 def test_negative_control_cache_genuinely_serves_stale_data_without_invalidation(isolated_db):
     """Necessary negative control: without going through the webhook
@@ -90,7 +91,6 @@ def test_negative_control_cache_genuinely_serves_stale_data_without_invalidation
     )
     db.close()
 
-
 def test_carrier_webhook_invalidation(isolated_db):
     from app.tools.carrier import get_carrier_gateway, handle_carrier_status_webhook
     from app.cache.tool_cache import get_tracking_cached
@@ -106,7 +106,6 @@ def test_carrier_webhook_invalidation(isolated_db):
     second = get_tracking_cached("TRK123")
     assert second["status"] == "delivered"
 
-
 def test_ttl_cache_expires_after_ttl():
     import time
     from app.cache.ttl_cache import TTLCache
@@ -117,7 +116,6 @@ def test_ttl_cache_expires_after_ttl():
     time.sleep(0.1)
     assert cache.get("k1") is None
 
-
 def test_ttl_cache_permanent_entry_never_expires():
     import time
     from app.cache.ttl_cache import TTLCache
@@ -126,7 +124,6 @@ def test_ttl_cache_permanent_entry_never_expires():
     cache.set("k1", "v1", ttl_seconds=None)
     time.sleep(0.1)
     assert cache.get("k1") == "v1"
-
 
 def test_embedding_cache_hit_skips_recompute():
     from app.cache.embedding_cache import get_or_compute_embedding
@@ -146,7 +143,6 @@ def test_embedding_cache_hit_skips_recompute():
     assert call_count["n"] == 1
     assert v1 == v2
 
-
 def test_embedding_cache_different_text_is_a_miss():
     from app.cache.embedding_cache import get_or_compute_embedding
 
@@ -159,7 +155,6 @@ def test_embedding_cache_different_text_is_a_miss():
     get_or_compute_embedding("text A", fake_compute)
     get_or_compute_embedding("text B", fake_compute)
     assert call_count["n"] == 2
-
 
 def test_retrieval_cache_hit_recorded_in_trace(isolated_db):
     """Confirms the second identical query is served from cache, not

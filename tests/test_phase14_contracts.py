@@ -10,12 +10,9 @@ from datetime import datetime, timezone
 
 import pytest
 
-
 @pytest.fixture(autouse=True)
 def isolated_db():
-    tmp_path = os.path.join(tempfile.gettempdir(), "test_phase14_contracts.db")
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    tmp_path = os.path.join(tempfile.gettempdir(), f"test_phase14_contracts_{os.getpid()}_{id(object())}.db")
     os.environ["DATABASE_URL"] = f"sqlite:///{tmp_path}"
 
     from app.core.config import get_settings
@@ -28,9 +25,15 @@ def isolated_db():
 
     yield db_module
 
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    try:
 
+        if os.path.exists(tmp_path):
+
+            os.remove(tmp_path)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
 @pytest.fixture(autouse=True)
 def reset_all():
@@ -41,7 +44,6 @@ def reset_all():
     reset_fake_carrier()
     reset_all_breakers()
     yield
-
 
 def test_diagnosis_result_root_causes_contract_matches_resolution_workflow_input(isolated_db):
     """Contract: DiagnosisResult.root_causes is a list[str] of the exact
@@ -85,7 +87,6 @@ def test_diagnosis_result_root_causes_contract_matches_resolution_workflow_input
     assert decision.action.value == "refund"
     db.close()
 
-
 def test_inventory_agent_output_contract_matches_resolution_workflow_input():
     """Contract: run_inventory_agent()'s output has 'any_shortfall' (bool)
     at the top level - propose_resolution_decision() reads exactly this
@@ -93,9 +94,7 @@ def test_inventory_agent_output_contract_matches_resolution_workflow_input():
     from app.agents.workflow_agents import run_inventory_agent
     from app.agents.resolution_policy_workflow import propose_resolution_decision
 
-    tmp_path = os.path.join(tempfile.gettempdir(), "test_phase14_inv_contract.db")
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    tmp_path = os.path.join(tempfile.gettempdir(), f"test_phase14_inv_contract_{os.getpid()}_{id(object())}.db")
     os.environ["DATABASE_URL"] = f"sqlite:///{tmp_path}"
     from app.core.config import get_settings
     get_settings.cache_clear()
@@ -119,9 +118,15 @@ def test_inventory_agent_output_contract_matches_resolution_workflow_input():
     )
     assert decision.action.value == "partial_credit"
     db.close()
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    try:
 
+        if os.path.exists(tmp_path):
+
+            os.remove(tmp_path)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
 def test_resolution_result_contract_matches_execution_agent_input(isolated_db):
     """Contract: ResolutionResult.decision is a ResolutionDecision object

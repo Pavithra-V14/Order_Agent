@@ -1,14 +1,48 @@
 """
 Metrics - architecture doc 8.7's full list, computed from TraceSpanRecord,
-ExceptionCase, IdempotencyRecord, and AlertRecord. Feeds the /metrics/{scope}
-API endpoints which the Metrics Dashboard frontend page will render.
+ExceptionCase, IdempotencyRecord, AuditLogEntry, and AlertRecord.
+
+HONEST STATUS (found and documented directly, not glossed over): the
+guide's Part 8.7 lists ~23 distinct named metrics across 4 categories.
+This file originally implemented about 6 of them. Fixed here to add
+every metric computable from data ALREADY being collected (no new
+instrumentation needed) — but several genuinely require either new
+instrumentation this build hasn't added yet, or external business inputs
+this system has no way to know on its own. Both kinds are named
+explicitly below, not silently dropped.
+
+STILL MISSING, and why:
+- Per-tool failure rate/latency, tool selection accuracy, tool-call
+  argument validity rate, read/write ratio: requires wrapping every
+  individual tool call (payment.py, wms.py, carrier.py, oms.py) in its
+  own record_span() — currently only resolution_policy_workflow.py
+  calls record_span() directly. Real, scoped follow-up: add tracing at
+  the tool-wrapper layer, not a metrics-file problem.
+- Precision/recall @k on a golden policy-QA set: needs labeled
+  query->expected-doc_id pairs in a specific shape the golden set
+  (tests/golden_set.py) doesn't currently define — needs a genuine new
+  eval artifact, not just a new metrics query.
+- Reranker lift, index freshness lag: needs the retrieval pipeline to
+  record pre-rerank AND post-rerank scores, and the ingestion pipeline
+  to record an upload-to-searchable timestamp — neither currently
+  captured.
+- Guardrail trigger accuracy (false positive/negative rate): requires
+  ground-truth human feedback on whether each block/escalate was
+  CORRECT, which is inherently a human-review data source, not
+  something computable from telemetry alone.
+- Cost per successful workflow, user adoption rate, business KPI delta:
+  the guide itself flags these as "most commonly skipped" for a reason —
+  they need external inputs this system doesn't model at all (LLM/API
+  token pricing, a defined "eligible user" population, a pre-agent
+  baseline to compare against). Not a code gap; a business-input gap
+  that needs a defined data source before it's meaningful to compute.
 """
 from __future__ import annotations
 
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
-from app.core.db import ExceptionCase, CaseState, TraceSpanRecord, IdempotencyRecord, AlertRecord
+from app.core.db import ExceptionCase, CaseState, TraceSpanRecord, IdempotencyRecord, AlertRecord, AuditLogEntry
 
 
 def compute_agent_metrics(db: Session) -> dict:
@@ -26,12 +60,42 @@ def compute_agent_metrics(db: Session) -> dict:
         if step_counts:
             avg_steps = sum(step_counts) / len(step_counts)
 
+    # Loop/step-ceiling hit rate — computable from AuditLogEntry's
+    # "diagnosis_complete" entries (app/agents/orchestrator.py already
+    # writes result.terminated_reason into detail on every diagnosis run;
+    # no new instrumentation needed, just a query that wasn't written yet).
+    diagnosis_complete_entries = db.query(AuditLogEntry).filter(AuditLogEntry.action == "diagnosis_complete").all()
+    terminated_reason_counts = {}
+    for e in diagnosis_complete_entries:
+        reason = (e.detail or {}).get("terminated_reason", "unknown")
+        terminated_reason_counts[reason] = terminated_reason_counts.get(reason, 0) + 1
+    total_diagnoses = sum(terminated_reason_counts.values())
+    step_ceiling_hit_rate = (
+        terminated_reason_counts.get("max_steps_reached", 0) / total_diagnoses
+    ) if total_diagnoses else None
+
+    # Escalation reason distribution — from ExceptionCase.resolution_decision's
+    # routing_reasons where present (populated by resolution_policy_workflow's
+    # ResolutionResult; stored on the case by whichever caller applies it).
+    escalated_cases = db.query(ExceptionCase).filter(ExceptionCase.state == CaseState.ESCALATED).all()
+    escalation_reason_counts = {}
+    for c in escalated_cases:
+        if c.fraud_flag:
+            escalation_reason_counts["fraud_flag"] = escalation_reason_counts.get("fraud_flag", 0) + 1
+        elif c.resolution_decision and c.resolution_decision.get("confidence", 1.0) < 0.90:
+            escalation_reason_counts["low_confidence"] = escalation_reason_counts.get("low_confidence", 0) + 1
+        else:
+            escalation_reason_counts["other"] = escalation_reason_counts.get("other", 0) + 1
+
     return {
         "total_cases": total_cases,
         "cases_by_state": {(k.value if hasattr(k, "value") else str(k)): v for k, v in by_state.items()},
         "escalation_rate": (escalated / total_cases) if total_cases else 0.0,
         "resolution_rate": (resolved / total_cases) if total_cases else 0.0,
         "avg_diagnosis_steps": avg_steps,
+        "diagnosis_terminated_reason_distribution": terminated_reason_counts,
+        "step_ceiling_hit_rate": step_ceiling_hit_rate,
+        "escalation_reason_distribution": escalation_reason_counts,
     }
 
 
@@ -47,6 +111,9 @@ def compute_tool_metrics(db: Session) -> dict:
         "successful_write_calls_by_tool": idempotency_by_tool,
         "circuit_breaker_trip_count": circuit_trips,
         "idempotency_collision_count": idempotency_collisions,
+        # See module docstring: per-tool failure rate/latency, tool
+        # selection accuracy, argument validity rate, and read/write
+        # ratio all require per-tool-call tracing not yet added.
     }
 
 
@@ -93,11 +160,24 @@ def compute_rag_metrics(db: Session) -> dict:
 
     groundedness_score = (grounded_count / total_citing_decisions) if total_citing_decisions else None
 
+    # Retrieval hit rate — % of retrieval spans that returned at least
+    # one result. Computable directly from num_results already recorded
+    # on every rag_retrieval span (app/rag/traced_retrieval.py) — no new
+    # instrumentation needed.
+    retrievals_with_results = sum(
+        1 for s in retrieval_spans if isinstance(s.output, dict) and s.output.get("num_results", 0) > 0
+    )
+    retrieval_hit_rate = (retrievals_with_results / len(retrieval_spans)) if retrieval_spans else None
+
     return {
         "retrieval_span_count": len(retrieval_spans),
+        "retrieval_hit_rate": retrieval_hit_rate,
         "citing_decision_count": total_citing_decisions,
         "groundedness_score": groundedness_score,
         "per_case_groundedness": per_case_groundedness,
+        # See module docstring: precision/recall@k, reranker lift, and
+        # index freshness lag all require new instrumentation/eval
+        # artifacts not yet built.
     }
 
 
@@ -112,6 +192,19 @@ def compute_system_metrics(db: Session) -> dict:
         if isinstance(s.span_metadata, dict) and s.span_metadata.get("latency_ms") is not None
     ]
     avg_latency_ms = (sum(latencies) / len(latencies)) if latencies else None
+    p95_latency_ms = None
+    if latencies:
+        sorted_latencies = sorted(latencies)
+        p95_latency_ms = sorted_latencies[int(len(sorted_latencies) * 0.95)]
+
+    # Audit log completeness % — every case must have at least one
+    # AuditLogEntry (its own state_transition into DETECTED, at minimum).
+    # Computable directly from existing data, catches a real regression
+    # class: a case created via some code path that skips writing its
+    # initial audit row.
+    total_cases = db.query(ExceptionCase).count()
+    cases_with_audit_entries = db.query(AuditLogEntry.case_id).distinct().count()
+    audit_completeness_pct = (cases_with_audit_entries / total_cases * 100) if total_cases else None
 
     return {
         "total_spans_recorded": total_spans,
@@ -119,4 +212,12 @@ def compute_system_metrics(db: Session) -> dict:
         "error_rate": (error_spans / total_spans) if total_spans else 0.0,
         "total_alerts": all_alerts,
         "avg_span_latency_ms": round(avg_latency_ms, 2) if avg_latency_ms is not None else None,
+        "p95_span_latency_ms": round(p95_latency_ms, 2) if p95_latency_ms is not None else None,
+        "audit_log_completeness_pct": round(audit_completeness_pct, 1) if audit_completeness_pct is not None else None,
+        # See module docstring: cost per successful workflow, guardrail
+        # trigger accuracy, user adoption rate, and business KPI delta
+        # all require external inputs (pricing, human review labels, a
+        # defined user population, a pre-agent baseline) this system has
+        # no way to know from telemetry alone — not computed here, and
+        # deliberately not faked with a placeholder number.
     }

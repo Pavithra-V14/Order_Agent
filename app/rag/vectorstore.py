@@ -32,6 +32,15 @@ _client_singleton_key: str | None = None
 
 
 def get_qdrant_client() -> QdrantClient:
+    """Returns the process-wide Qdrant client. Three modes, chosen
+    automatically from settings:
+      1. qdrant_url + qdrant_api_key set -> Qdrant Cloud (cloud.qdrant.io),
+         no Docker needed, free tier available.
+      2. qdrant_url set alone -> any self-hosted/reachable Qdrant server
+         (e.g. a VM running Qdrant directly, still no Docker required).
+      3. neither set -> embedded local mode (this sandbox's default),
+         writes to qdrant_local_path, no server of any kind needed.
+    """
     global _client_singleton, _client_singleton_key
     settings = get_settings()
     key = settings.qdrant_url or settings.qdrant_local_path
@@ -42,7 +51,7 @@ def get_qdrant_client() -> QdrantClient:
         _client_singleton.close()
 
     if settings.qdrant_url:
-        _client_singleton = QdrantClient(url=settings.qdrant_url)
+        _client_singleton = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
     else:
         _client_singleton = QdrantClient(path=settings.qdrant_local_path)
     _client_singleton_key = key
@@ -61,11 +70,37 @@ def _date_to_int(d: str | date) -> int:
 
 
 def ensure_collection(client: QdrantClient, collection: str, dim: int) -> None:
+    """Creates the collection AND the payload indexes every filtered
+    field needs. This is the real bug found running against Qdrant
+    Cloud: a managed/remote Qdrant instance REQUIRES an explicit payload
+    index before you can filter on a field at all — "Index required but
+    not found for 'effective_start_num'" — whereas Qdrant's embedded
+    local mode (this project's original dev/test default) filters on any
+    payload field without one. This never surfaced during local-only
+    development for exactly that reason; it's a genuine production-vs-
+    dev-mode gap in Qdrant itself, not something either mode "does wrong."
+    create_payload_index is idempotent (safe to call on an existing
+    collection/index — Qdrant no-ops if it's already there), so this runs
+    unconditionally rather than only on first creation.
+    """
+    from qdrant_client.models import PayloadSchemaType
+
     existing = [c.name for c in client.get_collections().collections]
     if collection not in existing:
         client.create_collection(
             collection_name=collection,
             vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+        )
+
+    for field_name, schema_type in [
+        ("effective_start_num", PayloadSchemaType.INTEGER),
+        ("effective_end_num", PayloadSchemaType.INTEGER),
+        ("doc_type", PayloadSchemaType.KEYWORD),
+        ("channel", PayloadSchemaType.KEYWORD),
+        ("product_category", PayloadSchemaType.KEYWORD),
+    ]:
+        client.create_payload_index(
+            collection_name=collection, field_name=field_name, field_schema=schema_type,
         )
 
 

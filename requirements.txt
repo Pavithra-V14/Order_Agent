@@ -1,4 +1,15 @@
-# ── Phase 0: installed and verified working in this build ──────────────────
+# =============================================================================
+# All-cloud, no-Docker production stack. Every external dependency below has
+# a REAL implementation (not a stub) that activates automatically once its
+# credential is set in .env — see .env.example for signup links to each
+# service's free tier. Leave any credential unset and the corresponding
+# local-first fallback (SQLite / in-process cache+queue / embedded Qdrant /
+# TF-IDF embeddings / rule-based fake LLM) is used instead — nothing crashes
+# on a partial configuration, and Docker is never required anywhere in this
+# stack, in either mode.
+# =============================================================================
+
+# ── Core (always required) ──────────────────────────────────────────────────
 fastapi>=0.141
 uvicorn[standard]>=0.30
 pydantic>=2.13
@@ -6,85 +17,151 @@ pydantic-settings>=2.0
 sqlalchemy>=2.0
 python-dotenv>=1.0
 httpx>=0.27
-jinja2>=3.1.5                # Phase 13 frontend (Jinja2Templates) — NOT guaranteed by plain `fastapi`,
-                               # only by the `fastapi[standard]` extra; confirmed missing from a fresh
-                               # install of this file's base fastapi line during Phase 13 testing.
+jinja2>=3.1.5                  # HTML templating (frontend) — NOT guaranteed by plain
+                                 # `fastapi`, only by the `fastapi[standard]` extra;
+                                 # confirmed missing from a fresh bare-fastapi install.
+python-multipart>=0.0.9        # required by FastAPI for UploadFile (policy upload endpoint)
 pytest>=8.0
-python-multipart>=0.0.9      # required by FastAPI for UploadFile (Phase 12 policy upload endpoint)
-jinja2>=3.1.5                 # required for HTML templating (Phase 13 frontend) — NOT a guaranteed
-                                # fastapi[standard]-only extra, confirmed via importlib.metadata during
-                                # Phase 13 packaging; a bare `fastapi` install does not pull this in
-pytest-cov>=5.0                # Phase 14 - coverage measurement, wired into .github/workflows/ci.yml
+pytest-cov>=5.0
+respx>=0.20                     # test-only: mocks httpx for Groq/Mistral/EasyPost tests
 
-# ── Phase 3 (RAG): installed and verified working in this build ────────────
-# NOTE: this project's Phase 3 substitutes lightweight, disk-budget-friendly
-# implementations for two architecture-doc picks that didn't fit this
-# sandbox's ~6GB free disk (unstructured[pdf]'s hi_res layout model and
-# self-hosted BGE-M3 both pull in torch + ~2GB+ of weights). Both
-# substitutes sit behind the same interface the real implementation would
-# use — see app/rag/embeddings.py and app/rag/extraction.py docstrings for
-# the exact swap points and why.
-pdfplumber>=0.11          # extraction.py -- text + native table detection (unstructured.io substitute)
-pdf2image>=1.17            # extraction.py -- chart/image page rasterization
-scikit-learn>=1.5           # embeddings.py -- TfidfEmbedder (BGE-M3 substitute)
-rank_bm25>=0.2.2             # retrieval.py -- sparse/BM25 side of hybrid search
-qdrant-client>=1.11           # vectorstore.py -- embedded local mode, real Qdrant-server-ready
-reportlab>=4.4                 # scripts/generate_policy_pdfs.py -- Phase 2 corpus authoring
-matplotlib>=3.9                 # scripts/generate_policy_pdfs.py -- chart generation for the corpus
+# ── Database — cloud Postgres, no Docker ────────────────────────────────────
+# Falls back to local SQLite if DATABASE_URL is unset. For cloud Postgres:
+# Neon (neon.tech) or Supabase both give a free-tier instance in ~1 minute —
+# just set DATABASE_URL to their connection string. psycopg (v3) is
+# SQLAlchemy's modern driver for any postgresql:// URL, picked automatically.
+psycopg[binary]>=3.1
 
-# ── Phase 3 (RAG), production-grade swap-ins — NOT installed in this sandbox ──
-# llama-index-core            # optional: adopt LlamaIndex's node/pipeline abstractions wholesale
-# llama-index-vector-stores-qdrant
-# unstructured[pdf]            # real hi_res extraction — needs ~2-3GB disk (torch + layout model)
-# FlagEmbedding                 # real BGE-M3 + BGE-Reranker — needs ~2-4GB disk (torch + model weights)
+# ── Cache + async job queue — Upstash Redis, no Docker ──────────────────────
+# Falls back to in-process (single-process only) if REDIS_URL is unset.
+# Powers BOTH app/cache/ttl_cache.py (RedisTTLCache) AND
+# app/workers/job_queue.py (RQJobQueue) from the SAME Redis instance.
+# Tested against a real local redis-server in this build (tests/
+# test_redis_cache.py, tests/test_rq_job_queue.py) — genuinely proven, not
+# just documented as a swap point.
+redis>=5.0
+rq>=2.0                          # IMPORTANT: RQ needs a SEPARATE worker process to
+                                   # actually execute jobs — run `python3 scripts/
+                                   # run_rq_worker.py` (or `rq worker`) as its own
+                                   # plain process (no Docker) alongside the API.
+                                   # See app/workers/job_queue.py's module docstring.
 
-# ── Phase 4 (tools/MCP): installed and verified working in this build ──────
-mcp>=2.1                      # official Anthropic MCP SDK
-stripe>=10.0                   # real Stripe SDK, wired but not network-callable in this sandbox (see app/tools/payment.py)
+# ── Vector store — Qdrant Cloud, no Docker ──────────────────────────────────
+# Falls back to Qdrant's embedded local mode (no server of any kind) if
+# QDRANT_URL is unset. Qdrant Cloud (cloud.qdrant.io) free tier: set both
+# QDRANT_URL and QDRANT_API_KEY.
+qdrant-client>=1.11
 
-# ── Phase 4, production-only — NOT installed (no network access here) ──────
-# easypost                      # or shippo — real carrier sandbox client
+# ── RAG pipeline (extraction, sparse retrieval, corpus authoring) ──────────
+pdfplumber>=0.11                # PDF extraction — text + native table detection
+pdf2image>=1.17                  # chart/image page rasterization
+rank_bm25>=0.2.2                  # sparse/BM25 side of hybrid search
+scikit-learn>=1.5                 # TfidfEmbedder — local embedding fallback (see below)
+reportlab>=4.4                     # scripts/generate_policy_pdfs.py — corpus authoring
+matplotlib>=3.9                     # scripts/generate_policy_pdfs.py — chart generation
 
-# ── Phase 5 (memory): installed and verified working in this build ─────────
-# (no extra packages — episodic.py is plain SQLAlchemy against EpisodeRecord)
+# Production-grade swap-ins for the RAG pipeline (heavier, NOT installed by
+# default — self-hosted alternatives to the cloud-first picks above):
+# unstructured[pdf]              # real hi_res layout-model extraction — needs ~2-3GB disk
+# FlagEmbedding                    # self-hosted BGE-M3 — needs ~2-4GB disk + GPU ideally
+# llama-index-core                 # optional: adopt LlamaIndex's pipeline abstractions
 
-# ── Phase 5, production-only — NOT installed (needs Neo4j/FalkorDB, no ──────
-# Docker/network access here; see app/memory/graphiti_adapter.py) ──────────
-# graphiti-core
+# ── LLM — Groq (cloud, no Docker) ───────────────────────────────────────────
+# GroqClient (app/agents/llm_client.py) auto-activates when GROQ_API_KEY is
+# set, falling back to the rule-based FakeLLMClient otherwise. Real httpx
+# calls against Groq's OpenAI-compatible chat completions API, tested
+# against realistic mocked responses (tests/test_groq_client.py).
 
-# ── Phase 6+ (orchestration): installed and verified working in this build ─
+# ── Embeddings — Mistral (cloud, no Docker) ─────────────────────────────────
+# MistralEmbedder (app/rag/embeddings.py) auto-activates when
+# MISTRAL_API_KEY is set, falling back to local TF-IDF otherwise. Tested
+# against realistic mocked responses (tests/test_mistral_embedder.py).
+# NOTE: switching embedding backends after documents are already indexed
+# requires re-ingesting into a NEW Qdrant collection (embedding dimensions
+# differ: TF-IDF=768, Mistral=1024) — see README for the migration note.
+
+# ── Carrier — EasyPost (cloud, no Docker) ───────────────────────────────────
+# EasyPostGateway (app/tools/carrier.py) auto-activates when
+# EASYPOST_API_KEY is set, falling back to FakeCarrierGateway otherwise.
+# Implemented as raw httpx calls against EasyPost's REST API directly
+# (NOT the `easypost` SDK package — that SDK uses `requests` internally,
+# which this project's respx-based test strategy can't intercept; a
+# "mocked" SDK-based test was confirmed to silently hit the real network
+# instead during development). Tested against realistic mocked responses
+# (tests/test_easypost_gateway.py).
+#
+# NOTE: EasyPost's 2026 onboarding now gates API key access behind adding
+# a payment method to your account first (a real, discovered-in-practice
+# change from the "no card needed" behavior their older docs describe).
+# If that's not something you want to do, ShippoGateway (below) is a
+# ready-to-use alternative requiring only a direct goshippo.com signup.
+
+# ── Carrier alternative — Shippo (cloud, no Docker) ─────────────────────────
+# ShippoGateway (app/tools/carrier.py) auto-activates when SHIPPO_API_KEY
+# is set — EasyPost takes priority if BOTH are configured (pick one in
+# practice, see get_carrier_gateway()). Same raw-httpx pattern as
+# EasyPostGateway, using Shippo's real REST API (ShippoToken auth scheme,
+# confirmed from their docs, not assumed). Tested against realistic
+# mocked responses (tests/test_shippo_gateway.py), including a dedicated
+# test proving the lowest-cost rate is actually selected, not just the
+# first one returned.
+
+# ── Payment — Stripe (cloud, no Docker) ─────────────────────────────────────
+stripe>=10.0                      # real Stripe SDK. StripeGateway (app/tools/payment.py)
+                                    # is written correctly against Stripe's real API shape
+                                    # but has NOT been network-tested from this sandbox (no
+                                    # route to api.stripe.com here) — verify against your own
+                                    # Stripe test-mode account before relying on it in staging.
+
+# ── Observability — Langfuse Cloud (cloud, no Docker) ───────────────────────
+# Dual-write: SQL (TraceSpanRecord) remains the primary store this
+# project's own metrics query directly; Langfuse Cloud is an ADDITIONAL
+# sink activated when LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY are set
+# AND TRACING_ENABLED=true, giving a real hosted trace UI. A Langfuse
+# failure is caught and logged, never allowed to break traced business
+# logic (tests/test_langfuse_tracing.py proves this explicitly).
+langfuse>=4.0
+
+# ── Tool layer / MCP ─────────────────────────────────────────────────────────
+mcp>=2.1                          # official Anthropic MCP SDK
+
+# ── Orchestration ────────────────────────────────────────────────────────────
 langgraph>=1.2
 langchain-core>=1.6
 
-# ── Phase 7 (guardrails): installed and verified working in this build ─────
-guardrails-ai>=0.11        # verified functional for offline Pydantic schema validation;
-                             # NOT used as the default Tier 2 path — see app/guardrails/
-                             # tier2_structural.py's docstring (unconditional OTLP telemetry
-                             # exporter adds multi-second network-retry delay per process in
-                             # this network-restricted sandbox). Kept installed + tested via
-                             # validate_with_guardrails_ai() for normal-network environments.
+# ── Guardrails ───────────────────────────────────────────────────────────────
+guardrails-ai>=0.11               # verified functional for offline Pydantic schema
+                                     # validation; NOT used as the default Tier 2 path
+                                     # (unconditional OTLP telemetry exporter adds
+                                     # multi-second delay per process) — see
+                                     # app/guardrails/tier2_structural.py. Direct Pydantic
+                                     # validation is the default; this stays installed +
+                                     # tested via validate_with_guardrails_ai() as an
+                                     # alternate path for environments where that's not a concern.
 
-# ── Phase 7, production-only — NOT installed (needs spaCy NER models, ~GB+
-# disk this sandbox doesn't have; see app/guardrails/tier2_structural.py) ──
+# Production-grade PII scanning swap-in — NOT installed (needs spaCy NER
+# models, multi-GB; the default regex-based scanner has no such cost but
+# also a narrower detection surface — see app/guardrails/tier2_structural.py):
 # llm-guard
 
-# ── Phase 10 (observability): built directly on SQLAlchemy, no extra deps ──
-# NOTE: architecture doc 8.8 specifies Langfuse. No network access to
-# Langfuse Cloud and no Docker to self-host in this sandbox, so tracing
-# is SQL-backed (TraceSpanRecord) with the identical span schema — see
-# app/core/tracing.py for the Langfuse swap point.
-# langfuse   # production-only, not installed here
+# ── Memory — long-term/episodic (Graphiti, installed and verified working) ──
+# Real Graphiti integration (app/memory/graphiti_adapter.py), auto-activates
+# when GROQ_API_KEY is set (Graphiti needs an LLM for entity/relationship
+# extraction regardless of graph store). Falls back to the SQL-backed
+# substitute (app/memory/episodic.py) otherwise — no extra package needed
+# for that path.
+graphiti-core>=0.30
+kuzu>=0.11                       # embedded graph database (no server, no Docker) —
+                                    # the local-first default graph store. NOTE:
+                                    # Graphiti's own KuzuDriver emits a deprecation
+                                    # warning at construction — "the upstream Kuzu
+                                    # project is no longer maintained, migrate to
+                                    # Neo4j or FalkorDB." Kept because it's still the
+                                    # only true zero-service local option and it
+                                    # genuinely works, but Neo4j Aura (below) is the
+                                    # actually-recommended path, not just an optional
+                                    # upgrade. See app/memory/graphiti_adapter.py.
+neo4j>=5.0                          # driver Graphiti's Neo4jDriver uses — activates
+                                      # when NEO4J_URI is set (Neo4j Aura: free tier,
+                                      # cloud, no Docker — the recommended graph store)
 
-# ── Phase 11+ (caching): add in Phase 11 ────────────────────────────────────
-
-# ── Phase 12 (API surface): built directly on FastAPI, no extra deps ───────
-# NOTE: architecture doc 8.1 specifies Redis+RQ/Celery for the async job
-# queue. No Redis/Docker in this sandbox, so app/workers/job_queue.py is a
-# real in-process queue.Queue + background thread worker behind the same
-# enqueue()/register_handler() interface RQ would expose.
-# rq   # production-only, not installed here
-
-# ── Staging/production only (Phase 16+): NOT needed for local/SQLite dev ───
-# psycopg2-binary            # Postgres driver, once DATABASE_URL points at Postgres
-# redis
-# rq                         # or celery, for the async job queue (8.1)

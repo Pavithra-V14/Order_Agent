@@ -9,12 +9,9 @@ import tempfile
 
 import pytest
 
-
 @pytest.fixture(autouse=True)
 def isolated_db():
-    tmp_path = os.path.join(tempfile.gettempdir(), "test_phase8.db")
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    tmp_path = os.path.join(tempfile.gettempdir(), f"test_phase8_{os.getpid()}_{id(object())}.db")
     os.environ["DATABASE_URL"] = f"sqlite:///{tmp_path}"
 
     from app.core.config import get_settings
@@ -27,9 +24,15 @@ def isolated_db():
 
     yield db_module
 
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    try:
 
+        if os.path.exists(tmp_path):
+
+            os.remove(tmp_path)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
 @pytest.fixture(autouse=True)
 def reset_all():
@@ -40,7 +43,6 @@ def reset_all():
     reset_fake_carrier()
     reset_all_breakers()
     yield
-
 
 def test_chaos_permanent_gateway_failure_trips_circuit_and_stays_pending_retry(isolated_db):
     """Permanent (not transient) failure: the gateway never recovers.
@@ -85,7 +87,6 @@ def test_chaos_permanent_gateway_failure_trips_circuit_and_stays_pending_retry(i
     assert record is None, "No idempotency record should exist - every attempt failed, nothing succeeded"
     db.close()
 
-
 def test_chaos_transient_failure_recovers_and_retry_does_not_duplicate(isolated_db):
     """The recovery half: gateway fails twice (transient) then succeeds on
     the 3rd attempt. Must end EXECUTED, with exactly 3 real gateway calls.
@@ -120,7 +121,6 @@ def test_chaos_transient_failure_recovers_and_retry_does_not_duplicate(isolated_
     )
     db.close()
 
-
 def test_circuit_resets_to_half_open_after_timeout(isolated_db):
     """The other half of the circuit breaker's contract: OPEN isn't
     permanent - after reset_timeout_seconds, the next call is allowed
@@ -140,7 +140,6 @@ def test_circuit_resets_to_half_open_after_timeout(isolated_db):
 
     time.sleep(0.1)
     assert breaker.state == CircuitState.HALF_OPEN, "circuit should allow a trial call again after the reset timeout"
-
 
 def test_verification_confirms_a_real_completed_refund(isolated_db):
     from app.tools.payment import get_payment_gateway
@@ -162,7 +161,6 @@ def test_verification_confirms_a_real_completed_refund(isolated_db):
     assert verification.status == VerificationStatus.VERIFIED
     db.close()
 
-
 def test_verification_fails_when_no_record_exists(isolated_db):
     from app.agents.verification_agent import verify_refund, VerificationStatus
 
@@ -170,7 +168,6 @@ def test_verification_fails_when_no_record_exists(isolated_db):
     verification = verify_refund(db, "case-nonexistent:refund")
     assert verification.status == VerificationStatus.VERIFICATION_FAILED
     db.close()
-
 
 def test_verification_reship_not_yet_verifiable_before_carrier_scan(isolated_db):
     from app.agents.execution_agent import execute_resolution
@@ -188,7 +185,6 @@ def test_verification_reship_not_yet_verifiable_before_carrier_scan(isolated_db)
     assert verification.status == VerificationStatus.NOT_YET_VERIFIABLE
     db.close()
 
-
 def test_comms_sends_refund_notification_with_correct_amount():
     from app.tools.notification import reset_sent_log, get_sent_notifications
     from app.agents.comms_workflow import send_case_notification
@@ -198,7 +194,6 @@ def test_comms_sends_refund_notification_with_correct_amount():
     sent = get_sent_notifications("CUST-1")
     assert len(sent) == 1
     assert "42.50" in sent[0]["body"]
-
 
 def test_comms_unknown_event_raises():
     from app.agents.comms_workflow import send_case_notification

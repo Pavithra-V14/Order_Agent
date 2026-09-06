@@ -8,7 +8,6 @@ import pytest
 from app.guardrails.schema import ResolutionDecision, ResolutionAction, CitedPolicy, RoutingOutcome
 from app.agents.resolution_policy_workflow import run_resolution_policy_workflow
 
-
 # ---------------------------------------------------------------------------
 # THE three core Phase 7 DoD scenarios
 # ---------------------------------------------------------------------------
@@ -28,7 +27,6 @@ def test_case_auto_executable():
     assert result.tier1_passed and result.tier2_passed
     assert result.decision.action == ResolutionAction.REFUND
 
-
 def test_case_escalation_fraud_flag():
     """Otherwise-clean, high-confidence decision, but a fraud flag is
     present -> must ESCALATE, never AUTO_EXECUTE, regardless of how
@@ -46,7 +44,6 @@ def test_case_escalation_fraud_flag():
     assert result.routing == RoutingOutcome.ESCALATE
     assert any("fraud flag" in r for r in result.routing_reasons)
     assert result.tier1_passed and result.tier2_passed   # the PROPOSAL itself was structurally fine
-
 
 def test_case_tier1_blocks_regardless_of_confidence():
     """Tier 1's core promise: a decision with confidence=1.0 and an
@@ -75,7 +72,6 @@ def test_case_tier1_blocks_regardless_of_confidence():
     assert result.tier1_passed is False
     assert any("5000" in r or "hard ceiling" in r for r in result.routing_reasons)
 
-
 # ---------------------------------------------------------------------------
 # Tier 1 unit tests (isolated from the full workflow)
 # ---------------------------------------------------------------------------
@@ -90,7 +86,6 @@ def test_tier1_blocks_monetary_action_with_no_citation():
     assert result.passed is False
     assert any("no cited_policy" in v for v in result.violations)
 
-
 def test_tier1_passes_a_reasonable_decision():
     from app.guardrails.tier1_ceilings import check_tier1_ceilings
     decision = ResolutionDecision(
@@ -102,7 +97,6 @@ def test_tier1_passes_a_reasonable_decision():
     assert result.passed is True
     assert result.violations == []
 
-
 # ---------------------------------------------------------------------------
 # Tier 2 unit tests
 # ---------------------------------------------------------------------------
@@ -112,7 +106,6 @@ def test_tier2_rejects_malformed_decision_object():
     result = validate_structure(malformed)
     assert result.passed is False
     assert len(result.errors) > 0
-
 
 def test_tier2_detects_pii_in_reasoning():
     from app.guardrails.tier2_structural import run_tier2
@@ -125,7 +118,6 @@ def test_tier2_detects_pii_in_reasoning():
     assert result.passed is False
     assert any(f["type"] == "email" for f in result.pii_findings)
 
-
 def test_tier2_passes_clean_decision():
     from app.guardrails.tier2_structural import run_tier2
     raw = {
@@ -135,7 +127,6 @@ def test_tier2_passes_clean_decision():
     }
     result = run_tier2(raw)
     assert result.passed is True
-
 
 # ---------------------------------------------------------------------------
 # Tier 3 (async judge) unit tests
@@ -150,7 +141,6 @@ def test_tier3_flags_hallucinated_policy_citation():
     result = run_tier3_async_sample("case-1", decision, known_policy_doc_ids={"RET-POLICY-2025-A", "RET-POLICY-2026-A"})
     assert result["tier3_passed"] is False
     assert result["quality_score"] < 1.0
-
 
 def test_tier3_passes_valid_citation():
     from app.guardrails.tier3_judge import run_tier3_async_sample

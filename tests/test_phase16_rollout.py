@@ -9,12 +9,9 @@ import tempfile
 
 import pytest
 
-
 @pytest.fixture(autouse=True)
 def isolated_db():
-    tmp_path = os.path.join(tempfile.gettempdir(), "test_phase16.db")
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    tmp_path = os.path.join(tempfile.gettempdir(), f"test_phase16_{os.getpid()}_{id(object())}.db")
     os.environ["DATABASE_URL"] = f"sqlite:///{tmp_path}"
 
     from app.core.config import get_settings
@@ -27,12 +24,18 @@ def isolated_db():
 
     yield db_module
 
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    try:
+
+        if os.path.exists(tmp_path):
+
+            os.remove(tmp_path)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
     os.environ.pop("AUTO_EXECUTION_ENABLED", None)
     from app.core.config import get_settings as gs
     gs.cache_clear()
-
 
 @pytest.fixture(autouse=True)
 def reset_all():
@@ -41,7 +44,6 @@ def reset_all():
     reset_fake_gateway()
     reset_all_breakers()
     yield
-
 
 def test_rollback_disables_auto_execution_for_all_new_cases_in_under_5_minutes(isolated_db):
     """THE Phase 16 rollback test."""
@@ -79,7 +81,6 @@ def test_rollback_disables_auto_execution_for_all_new_cases_in_under_5_minutes(i
     assert result_after.routing.value == "escalate"
     assert any("globally disabled" in r for r in result_after.routing_reasons)
 
-
 def test_rollback_does_not_affect_tier1_blocking(isolated_db):
     """The rollback switch controls AUTO_EXECUTE-vs-ESCALATE only - it
     must NOT weaken Tier 1's hard ceilings."""
@@ -103,7 +104,6 @@ def test_rollback_does_not_affect_tier1_blocking(isolated_db):
     )
     assert result.routing.value == "blocked", "Tier 1 blocking must remain active regardless of the rollback switch"
 
-
 def test_staged_rollout_internal_stage(isolated_db):
     """Stage 1 (Internal): a handful of synthetic requests, confirming
     basic health before widening exposure."""
@@ -120,7 +120,6 @@ def test_staged_rollout_internal_stage(isolated_db):
     from tests.golden_set import run_golden_set
     results = run_golden_set()
     assert all(r.passed for r in results), "Internal stage requires 8/8 golden set before proceeding to Beta"
-
 
 def test_staged_rollout_beta_stage(isolated_db):
     """Stage 2 (Beta): a small opt-in cohort's traffic, simulated as a
@@ -144,7 +143,6 @@ def test_staged_rollout_beta_stage(isolated_db):
             resp = client.get(f"/api/v1/cases/{case_id}")
             assert resp.status_code == 200
             assert resp.json()["state"] == "detected"
-
 
 def test_staged_rollout_wider_synthetic_load_stage(isolated_db):
     """Stage 3 (wider synthetic load): reuses Phase 14's load-test

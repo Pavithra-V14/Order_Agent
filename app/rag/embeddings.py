@@ -90,35 +90,94 @@ class TfidfEmbedder(BaseEmbedder):
 
 
 class LocalBGEEmbedder(BaseEmbedder):
-    """Production implementation per architecture doc 8.10 — self-hosted
-    BGE-M3, free forever, no rate limits, native hybrid dense+sparse.
-    Not runnable in this sandbox (disk budget) — implement when you have
-    ~4GB free disk (or a GPU box) via:
+    """Self-hosted alternative — BGE-M3, free forever, no per-request
+    cost or rate limit. Not used by default now that a cloud embedding
+    API (MistralEmbedder, below) is wired up and requires no Docker/GPU
+    box at all — but left implemented as a documented option for anyone
+    who wants zero per-request cost at higher volume than a free-tier
+    cloud API comfortably supports. Not runnable in THIS sandbox
+    (disk budget) — implement when you have ~4GB free disk (or a GPU box) via:
 
         pip install FlagEmbedding
         from FlagEmbedding import BGEM3FlagModel
         model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
         # model.encode(texts)['dense_vecs'] -> use as embed() return value
-
-    Left stubbed rather than silently swapped so nobody accidentally ships
-    the TF-IDF fallback to production without noticing.
     """
 
     def fit(self, corpus: list[str]) -> None:
-        return None  # pretrained model, no per-corpus fit step needed
+        return None
 
     def embed(self, texts: list[str]) -> np.ndarray:
         raise NotImplementedError(
             "LocalBGEEmbedder requires FlagEmbedding + BGE-M3 weights (~2.2GB), "
-            "not installed in this sandbox due to disk budget. See class docstring."
+            "not installed in this sandbox due to disk budget. See class docstring — "
+            "or use MistralEmbedder (cloud, no disk/GPU needed) instead."
         )
 
     @property
     def dim(self) -> int:
-        return 1024  # BGE-M3's native dense dimensionality
+        return 1024
+
+
+class MistralEmbedder(BaseEmbedder):
+    """Cloud embedding API — Mistral's `mistral-embed` model, no Docker,
+    no GPU, no local disk footprint at all. This is the recommended
+    default for an all-cloud deployment: a single REST call per batch of
+    texts, real 1024-dim dense embeddings.
+
+    Not network-tested from this sandbox (no route to api.mistral.ai in
+    the bash tool's allowed domains) — but the request/response handling
+    is tested against a realistic mocked response via respx
+    (tests/test_mistral_embedder.py), the same verification strategy
+    used for GroqClient.
+    """
+
+    def __init__(self):
+        from app.core.config import get_settings
+        settings = get_settings()
+        self._api_key = settings.mistral_api_key
+        if not self._api_key:
+            raise RuntimeError("MISTRAL_API_KEY not configured - see .env.example")
+        import httpx
+        self._client = httpx.Client(
+            base_url="https://api.mistral.ai/v1",
+            headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
+            timeout=30.0,
+        )
+        self._dim = 1024  # mistral-embed's native output dimensionality
+
+    def fit(self, corpus: list[str]) -> None:
+        return None  # pretrained model, no per-corpus fit step needed
+
+    def embed(self, texts: list[str], max_retries: int = 2) -> np.ndarray:
+        if not texts:
+            return np.zeros((0, self._dim), dtype="float32")
+
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                resp = self._client.post("/embeddings", json={"model": "mistral-embed", "input": texts})
+                resp.raise_for_status()
+                data = resp.json()["data"]
+                vectors = np.array([d["embedding"] for d in data], dtype="float32")
+                return vectors
+            except Exception as e:
+                last_error = e
+                continue
+        raise RuntimeError(f"Mistral embeddings API call failed after {max_retries + 1} attempts: {last_error}")
+
+    @property
+    def dim(self) -> int:
+        return self._dim
 
 
 def get_embedder() -> BaseEmbedder:
-    """Factory — swap this one line to change embedder implementation
-    everywhere in the pipeline at once."""
+    """Factory — auto-selects MistralEmbedder (cloud, no Docker/GPU) when
+    MISTRAL_API_KEY is configured, falling back to the local TF-IDF
+    substitute otherwise. Same settings-driven pattern as get_llm_client()
+    (Groq), get_cache() (Redis), and get_qdrant_client() (Qdrant Cloud)."""
+    from app.core.config import get_settings
+    settings = get_settings()
+    if settings.mistral_api_key:
+        return MistralEmbedder()
     return TfidfEmbedder()

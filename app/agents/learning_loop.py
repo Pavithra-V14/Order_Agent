@@ -23,7 +23,7 @@ import numpy as np
 from sqlalchemy.orm import Session
 
 from app.core.db import ResolutionPatternEntry, ThresholdProposalRecord, ThresholdOverrideRecord
-from app.rag.embeddings import TfidfEmbedder
+from app.rag.embeddings import get_embedder
 
 
 def record_resolution_outcome(
@@ -72,7 +72,7 @@ def retrieve_similar_past_resolutions(db: Session, query_feature_summary: str, k
         return []
 
     corpus = [e.case_feature_summary for e in entries] + [query_feature_summary]
-    embedder = TfidfEmbedder(max_features=256)
+    embedder = get_embedder()
     embedder.fit(corpus)
     vectors = embedder.embed(corpus)
     query_vec = vectors[-1]

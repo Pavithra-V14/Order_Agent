@@ -17,7 +17,6 @@ import pytest
 TEST_QDRANT_PATH = "data/qdrant_local_test_phase3"
 TEST_REINDEX_STATE = "data/reindex_state_test_phase3.json"
 
-
 @pytest.fixture(scope="module", autouse=True)
 def ingested_corpus():
     """Ingests the real policy PDF corpus into an isolated test Qdrant
@@ -58,14 +57,12 @@ def ingested_corpus():
     if os.path.exists(TEST_REINDEX_STATE):
         os.remove(TEST_REINDEX_STATE)
 
-
 def test_ingestion_parsed_both_policy_versions_correctly(ingested_corpus):
     by_doc = {s["doc_id"]: s for s in ingested_corpus}
     assert by_doc["RET-POLICY-2025-A"]["effective_start"] == "2025-01-01"
     assert by_doc["RET-POLICY-2025-A"]["effective_end"] == "2026-01-31"
     assert by_doc["RET-POLICY-2026-A"]["effective_start"] == "2026-02-01"
     assert by_doc["RET-POLICY-2026-A"]["effective_end"] is None
-
 
 def test_order_under_old_policy_retrieves_old_window_not_new(ingested_corpus):
     """THE core acceptance test. Order purchased 2025-06-15 -> falls inside
@@ -93,7 +90,6 @@ def test_order_under_old_policy_retrieves_old_window_not_new(ingested_corpus):
         f"Expected the old 180-day apparel window in retrieved text, got: {all_text}"
     )
 
-
 def test_order_under_new_policy_retrieves_new_window_not_old(ingested_corpus):
     """The mirror case: an order placed AFTER the 2026-02-01 cutover must
     retrieve the current 120-day window, not the superseded 180-day one."""
@@ -118,7 +114,6 @@ def test_order_under_new_policy_retrieves_new_window_not_old(ingested_corpus):
         f"Expected the new 120-day apparel window in retrieved text, got: {all_text}"
     )
 
-
 def test_fraud_policy_not_retrieved_for_return_policy_query(ingested_corpus):
     """doc_type filtering: a return-window query should never surface the
     fraud policy document, even though both are "policy" documents."""
@@ -132,7 +127,6 @@ def test_fraud_policy_not_retrieved_for_return_policy_query(ingested_corpus):
     )
     doc_types = {r.metadata.get("doc_type") for r in results}
     assert doc_types <= {"return_policy"}, f"leaked non-return-policy doc: {doc_types}"
-
 
 def test_chart_caption_is_retrievable(ingested_corpus):
     """Proves the chart-extraction path (8.2.1) actually produced

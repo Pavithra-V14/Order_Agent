@@ -10,12 +10,9 @@ import tempfile
 
 import pytest
 
-
 @pytest.fixture(autouse=True)
 def isolated_db():
-    tmp_path = os.path.join(tempfile.gettempdir(), "test_phase14_errors.db")
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    tmp_path = os.path.join(tempfile.gettempdir(), f"test_phase14_errors_{os.getpid()}_{id(object())}.db")
     os.environ["DATABASE_URL"] = f"sqlite:///{tmp_path}"
 
     from app.core.config import get_settings
@@ -28,9 +25,15 @@ def isolated_db():
 
     yield db_module
 
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    try:
 
+        if os.path.exists(tmp_path):
+
+            os.remove(tmp_path)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
 @pytest.fixture(autouse=True)
 def reset_all():
@@ -42,14 +45,12 @@ def reset_all():
     reset_all_breakers()
     yield
 
-
 def test_oms_get_order_nonexistent_returns_none_not_crash(isolated_db):
     from app.tools.oms import get_order
     db = isolated_db.SessionLocal()
     result = get_order(db, "ORD-DOES-NOT-EXIST")
     assert result is None
     db.close()
-
 
 def test_diagnosis_handles_order_not_found_gracefully(isolated_db):
     """If the order genuinely doesn't exist, the diagnosis loop must not
@@ -63,7 +64,6 @@ def test_diagnosis_handles_order_not_found_gracefully(isolated_db):
     assert result.findings.get("order", {}).get("error") == "order not found"
     db.close()
 
-
 def test_wms_transfer_with_nonexistent_sku_raises_clean_valueerror(isolated_db):
     """A transfer request for a SKU with no stock record at all must
     raise a clean ValueError, not an unhandled AttributeError."""
@@ -74,13 +74,11 @@ def test_wms_transfer_with_nonexistent_sku_raises_clean_valueerror(isolated_db):
                         qty=1, idempotency_key="k1")
     db.close()
 
-
 def test_payment_get_transaction_status_nonexistent_raises_clean_error(isolated_db):
     from app.tools.payment import get_payment_gateway
     gateway = get_payment_gateway()
     with pytest.raises(ValueError):
         gateway.get_transaction_status("pi_never_seeded")
-
 
 def test_carrier_get_tracking_unknown_number_returns_unknown_status_not_crash():
     """An unrecognized tracking number returns status='unknown' rather
@@ -89,7 +87,6 @@ def test_carrier_get_tracking_unknown_number_returns_unknown_status_not_crash():
     gateway = get_carrier_gateway()
     result = gateway.get_tracking_status("TRK-NEVER-SEEDED")
     assert result["status"] == "unknown"
-
 
 def test_resolution_workflow_handles_empty_diagnosis_causes_list(isolated_db):
     """An empty root_causes list must not crash the resolution workflow."""
@@ -100,13 +97,11 @@ def test_resolution_workflow_handles_empty_diagnosis_causes_list(isolated_db):
     assert decision is not None
     assert decision.action.value == "refund"
 
-
 def test_tier2_rejects_completely_empty_decision_dict():
     from app.guardrails.tier2_structural import validate_structure
     result = validate_structure({})
     assert result.passed is False
     assert len(result.errors) > 0
-
 
 def test_chaos_carrier_permanent_failure(isolated_db):
     """Carrier label generation with a permanently failing carrier API:
@@ -142,7 +137,6 @@ def test_chaos_carrier_permanent_failure(isolated_db):
 
     gateway.generate_return_label = original_generate
     db.close()
-
 
 def test_chaos_wms_transfer_failure_leaves_no_partial_state(isolated_db):
     """A WMS transfer that fails mid-transaction must not leave stock in

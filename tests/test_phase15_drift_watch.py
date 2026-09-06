@@ -5,7 +5,6 @@ import os
 
 import pytest
 
-
 @pytest.fixture(autouse=True)
 def isolated_baseline():
     test_baseline_path = "data/golden_set_baseline_test.json"
@@ -19,11 +18,9 @@ def isolated_baseline():
     if os.path.exists(test_baseline_path):
         os.remove(test_baseline_path)
 
-
 def test_drift_check_with_no_baseline_reports_that_clearly(isolated_baseline):
     result = isolated_baseline.run_drift_check()
     assert result["status"] == "no_baseline"
-
 
 def test_establish_baseline_then_stable_check(isolated_baseline):
     baseline = isolated_baseline.establish_baseline()
@@ -33,7 +30,6 @@ def test_establish_baseline_then_stable_check(isolated_baseline):
     result = isolated_baseline.run_drift_check()
     assert result["status"] == "stable"
     assert result["regressions"] == []
-
 
 def test_drift_check_detects_a_real_regression(isolated_baseline, monkeypatch):
     """Proves the mechanism actually catches drift, not just that it can

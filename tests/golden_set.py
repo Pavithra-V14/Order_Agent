@@ -26,18 +26,14 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-
 @dataclass
 class ScenarioResult:
     name: str
     passed: bool
     detail: str
 
-
 def _fresh_db(suffix):
-    tmp_path = os.path.join(tempfile.gettempdir(), f"golden_set_{suffix}.db")
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    tmp_path = os.path.join(tempfile.gettempdir(), f"golden_set_{suffix}_{os.getpid()}_{id(object())}.db")
     os.environ["DATABASE_URL"] = f"sqlite:///{tmp_path}"
     from app.core.config import get_settings
     get_settings.cache_clear()
@@ -46,7 +42,6 @@ def _fresh_db(suffix):
     importlib.reload(db_module)
     db_module.init_db()
     return db_module, tmp_path
-
 
 def scenario_temporal_policy_correctness() -> ScenarioResult:
     """Edge case: policy changed mid-order-lifecycle. An order under the
@@ -85,13 +80,19 @@ def scenario_temporal_policy_correctness() -> ScenarioResult:
         shutil.rmtree(qdrant_path)
     if os.path.exists(reindex_state):
         os.remove(reindex_state)
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    try:
+
+        if os.path.exists(tmp_path):
+
+            os.remove(tmp_path)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
     passed = "RET-POLICY-2026-A" not in doc_ids and "180" in all_text
     return ScenarioResult("temporal_policy_correctness", passed,
                            f"retrieved doc_ids={doc_ids}, expected 180-day window present, 2026-A absent")
-
 
 def scenario_duplicate_refund_idempotency() -> ScenarioResult:
     """Edge case: duplicate refund on retry. Two calls with the same
@@ -106,13 +107,19 @@ def scenario_duplicate_refund_idempotency() -> ScenarioResult:
     r1 = gateway.issue_refund(db, "pi_golden_1", 42.0, idempotency_key="golden-key-1")
     r2 = gateway.issue_refund(db, "pi_golden_1", 42.0, idempotency_key="golden-key-1")
     db.close()
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    try:
+
+        if os.path.exists(tmp_path):
+
+            os.remove(tmp_path)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
     passed = gateway.refund_call_count == 1 and r1["id"] == r2["id"]
     return ScenarioResult("duplicate_refund_idempotency", passed,
                            f"call_count={gateway.refund_call_count}, same_id={r1['id'] == r2['id']}")
-
 
 def scenario_fraud_vs_high_ltv_customer() -> ScenarioResult:
     """Edge case: serial returner who is also high-value/low-fraud-risk.
@@ -132,13 +139,19 @@ def scenario_fraud_vs_high_ltv_customer() -> ScenarioResult:
     result = run_fraud_risk_agent(db, FakeLLMClient(), customer_id=customer_id,
                                    address_changed_same_day=False)
     db.close()
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    try:
+
+        if os.path.exists(tmp_path):
+
+            os.remove(tmp_path)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
     passed = result["flag"] is False and result["risk_score"] < 0.6
     return ScenarioResult("fraud_vs_high_ltv_customer", passed,
                            f"risk_score={result['risk_score']}, flag={result['flag']}, reasons={result['reasons']}")
-
 
 def scenario_multi_cause_diagnosis() -> ScenarioResult:
     """Edge case: compound root causes (payment decline + concurrent OOS)
@@ -162,13 +175,19 @@ def scenario_multi_cause_diagnosis() -> ScenarioResult:
 
     result = run_diagnosis(db, FakeLLMClient(), order_id="ORD-GOLDEN-MC", payment_intent_id="pi_golden_mc")
     db.close()
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    try:
+
+        if os.path.exists(tmp_path):
+
+            os.remove(tmp_path)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
     causes_text = " | ".join(result.root_causes)
     passed = "payment_issue" in causes_text and ("inventory_issue" in causes_text or "SKU-GOLDEN-MC" in causes_text)
     return ScenarioResult("multi_cause_diagnosis", passed, f"root_causes={result.root_causes}")
-
 
 def scenario_runaway_loop_terminates() -> ScenarioResult:
     """Edge case: a non-converging diagnosis loop must stop at the step
@@ -191,13 +210,19 @@ def scenario_runaway_loop_terminates() -> ScenarioResult:
 
     result = run_diagnosis(db, NeverConcludesLLM(), order_id="ORD-GOLDEN-RUNAWAY", max_steps=5)
     db.close()
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    try:
+
+        if os.path.exists(tmp_path):
+
+            os.remove(tmp_path)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
     passed = result.terminated_reason == "max_steps_reached" and len(result.steps_taken) == 5
     return ScenarioResult("runaway_loop_terminates", passed,
                            f"terminated_reason={result.terminated_reason}, steps={len(result.steps_taken)}")
-
 
 def scenario_tier1_hard_block() -> ScenarioResult:
     """Edge case: Tier 1 guardrail must block regardless of model
@@ -218,7 +243,6 @@ def scenario_tier1_hard_block() -> ScenarioResult:
     )
     passed = result.routing.value == "blocked" and result.tier1_passed is False
     return ScenarioResult("tier1_hard_block", passed, f"routing={result.routing.value}")
-
 
 def scenario_circuit_breaker_fails_fast() -> ScenarioResult:
     """Edge case: a permanently-failing dependency trips the circuit
@@ -245,13 +269,19 @@ def scenario_circuit_breaker_fails_fast() -> ScenarioResult:
                         payment_intent_id="pi_golden_circuit", max_retries=5)
     breaker = get_circuit_breaker("payment", failure_threshold=3, reset_timeout_seconds=30.0)
     db.close()
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    try:
+
+        if os.path.exists(tmp_path):
+
+            os.remove(tmp_path)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
     passed = breaker.state == CircuitState.OPEN and breaker.call_attempts == 3
     return ScenarioResult("circuit_breaker_fails_fast", passed,
                            f"state={breaker.state.value}, call_attempts={breaker.call_attempts}")
-
 
 def scenario_webhook_cache_invalidation() -> ScenarioResult:
     """Edge case: phantom stock - a webhook must invalidate the cache so
@@ -269,13 +299,19 @@ def scenario_webhook_cache_invalidation() -> ScenarioResult:
                                      new_on_hand_qty=2, new_sellable_qty=2)
     second_read = get_stock_cached(db, "SKU-GOLDEN-CACHE", "WH-A")
     db.close()
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    try:
+
+        if os.path.exists(tmp_path):
+
+            os.remove(tmp_path)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
     passed = second_read[0]["sellable_qty"] == 2
     return ScenarioResult("webhook_cache_invalidation", passed,
                            f"sellable_qty_after_webhook={second_read[0]['sellable_qty']}")
-
 
 ALL_SCENARIOS = [
     scenario_temporal_policy_correctness,
@@ -288,10 +324,8 @@ ALL_SCENARIOS = [
     scenario_webhook_cache_invalidation,
 ]
 
-
 def run_golden_set():
     return [scenario() for scenario in ALL_SCENARIOS]
-
 
 if __name__ == "__main__":
     results = run_golden_set()

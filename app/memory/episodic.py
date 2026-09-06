@@ -1,25 +1,20 @@
 """
-Long-term/episodic memory — architecture doc 8.4. Production pick is
-Zep/Graphiti (chosen specifically for time-aware relationship reasoning
-over a graph DB — the differentiator over Mem0, per the architecture
-doc). Graphiti requires a Neo4j or FalkorDB backend to actually run; this
-sandbox has no Docker and no network access to stand one up.
+Long-term/episodic memory - architecture doc 8.4. Auto-selects between
+two backends, same settings-driven pattern as every other cloud
+integration in this project:
 
-This module ships a SQL-backed substitute (`EpisodeRecord`, app/core/db.py)
-that satisfies the SPECIFIC functional contract this project's Phase 5 DoD
-requires — "query a customer's prior case history, correctly time-ordered"
-— without needing a graph database. What it does NOT give you that a real
-Graphiti deployment would: genuine multi-hop relationship traversal (e.g.
-"customers who share a shipping address with a known fraud case," or
-entity-relationship reasoning beyond a single customer_id key). This
-project's current agents (Phase 6+) only need the time-ordered-history
-query shape, so the gap is real but not yet load-bearing — flagged here so
-it isn't silently forgotten if a future phase needs graph traversal.
-
-Swap point: replace this module's functions with calls to a Graphiti
-client (`graphiti_core.Graphiti`) once running against a real Neo4j/
-FalkorDB instance — `log_episode`/`get_customer_history` map directly to
-Graphiti's `add_episode`/`search` methods.
+  1. GROQ_API_KEY set -> real Graphiti (app/memory/graphiti_adapter.py),
+     backed by Neo4j Aura (cloud) if NEO4J_URI is also set, or embedded
+     Kuzu (no server, no Docker, no credentials) otherwise. Graphiti
+     needs an LLM for entity/relationship extraction regardless of which
+     graph store backs it, which is why the Groq key is the actual
+     switch here, not a graph-specific setting.
+  2. No GROQ_API_KEY -> SQL-backed substitute (EpisodeRecord,
+     app/core/db.py). Satisfies this project's actual query shape (time-
+     ordered customer history) without a graph database, but doesn't
+     give genuine multi-hop relationship traversal (e.g. "customers who
+     share a shipping address with a known fraud case") the way a real
+     Graphiti deployment does — a real, if not yet load-bearing, gap.
 """
 from __future__ import annotations
 
@@ -30,11 +25,20 @@ from sqlalchemy.orm import Session
 from app.core.db import EpisodeRecord
 
 
+def _use_graphiti() -> bool:
+    from app.memory.graphiti_adapter import _is_graphiti_available
+    return _is_graphiti_available()
+
+
 def log_episode(db: Session, customer_id: str, episode_type: str, content: dict,
                  occurred_at: datetime, case_id: str | None = None) -> dict:
     """Records one episode (e.g., a resolved case, a fraud flag) tied to a
     customer. Called by the Orchestrator (Phase 6) on case resolution, and
     by the Fraud/Risk Agent when it raises a flag."""
+    if _use_graphiti():
+        from app.memory.graphiti_adapter import log_episode_graphiti
+        return log_episode_graphiti(customer_id, episode_type, content, occurred_at, case_id)
+
     episode = EpisodeRecord(
         customer_id=customer_id,
         case_id=case_id,
@@ -57,6 +61,10 @@ def get_customer_history(db: Session, customer_id: str, episode_type: str | None
     """Time-ordered (most recent first) episode history for a customer —
     this is the exact query the Customer Context Agent (Phase 6) uses to
     answer "has this customer had prior return issues" and similar."""
+    if _use_graphiti():
+        from app.memory.graphiti_adapter import get_customer_history_graphiti
+        return get_customer_history_graphiti(customer_id, episode_type, limit)
+
     q = db.query(EpisodeRecord).filter(EpisodeRecord.customer_id == customer_id)
     if episode_type:
         q = q.filter(EpisodeRecord.episode_type == episode_type)

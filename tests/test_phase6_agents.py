@@ -10,12 +10,9 @@ from datetime import datetime, timezone
 
 import pytest
 
-
 @pytest.fixture(autouse=True)
 def isolated_db():
-    tmp_path = os.path.join(tempfile.gettempdir(), "test_phase6.db")
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    tmp_path = os.path.join(tempfile.gettempdir(), f"test_phase6_{os.getpid()}_{id(object())}.db")
     os.environ["DATABASE_URL"] = f"sqlite:///{tmp_path}"
 
     from app.core.config import get_settings
@@ -28,9 +25,15 @@ def isolated_db():
 
     yield db_module
 
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    try:
 
+        if os.path.exists(tmp_path):
+
+            os.remove(tmp_path)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
 @pytest.fixture(autouse=True)
 def reset_gateways():
@@ -39,7 +42,6 @@ def reset_gateways():
     reset_fake_gateway()
     reset_fake_carrier()
     yield
-
 
 def test_multi_cause_diagnosis_identifies_both_payment_and_inventory(isolated_db):
     """THE core Phase 6 acceptance test: an order with BOTH a payment
@@ -82,7 +84,6 @@ def test_multi_cause_diagnosis_identifies_both_payment_and_inventory(isolated_db
     )
     db.close()
 
-
 def test_single_cause_case_does_not_over_report(isolated_db):
     """Sanity check the inverse: a normal, single-issue order should NOT
     spuriously report multiple causes — proves the multi-cause test above
@@ -110,7 +111,6 @@ def test_single_cause_case_does_not_over_report(isolated_db):
     assert result.terminated_reason == "concluded"
     assert result.root_causes == ["no_anomaly_detected: all checked systems report normal state"]
     db.close()
-
 
 def test_runaway_diagnosis_terminates_at_step_ceiling(isolated_db):
     """A deliberately non-converging planner (always requests a check with
@@ -143,7 +143,6 @@ def test_runaway_diagnosis_terminates_at_step_ceiling(isolated_db):
     assert len(result.steps_taken) == 5, f"Expected exactly max_steps=5 steps taken, got {len(result.steps_taken)}"
     db.close()
 
-
 def test_runaway_diagnosis_terminates_at_wall_clock_timeout(isolated_db):
     """The other half of the ceiling: even with a huge max_steps, a slow
     planner must be cut off by wall-clock time, not run indefinitely."""
@@ -173,16 +172,13 @@ def test_runaway_diagnosis_terminates_at_wall_clock_timeout(isolated_db):
     assert len(result.steps_taken) < 10_000  # proves the timeout fired, not the step ceiling
     db.close()
 
-
 def test_orchestrator_runs_full_diagnosis_phase_and_persists_state():
     """End-to-end: the LangGraph orchestrator runs start -> [diagnosis,
     fraud, inventory, customer_context] in parallel -> aggregate, and the
     ExceptionCase row reflects the results afterward — proving state
     persistence, not just in-memory graph state."""
     import os, tempfile
-    tmp_path = os.path.join(tempfile.gettempdir(), "test_phase6_orch.db")
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    tmp_path = os.path.join(tempfile.gettempdir(), f"test_phase6_orch_{os.getpid()}_{id(object())}.db")
     os.environ["DATABASE_URL"] = f"sqlite:///{tmp_path}"
 
     from app.core.config import get_settings
@@ -232,5 +228,12 @@ def test_orchestrator_runs_full_diagnosis_phase_and_persists_state():
     assert persisted_case.fraud_risk_score is not None
     db2.close()
 
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    try:
+
+        if os.path.exists(tmp_path):
+
+            os.remove(tmp_path)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file

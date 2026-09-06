@@ -12,12 +12,9 @@ import tempfile
 
 import pytest
 
-
 @pytest.fixture(autouse=True)
 def isolated_db():
-    tmp_path = os.path.join(tempfile.gettempdir(), "test_phase9.db")
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    tmp_path = os.path.join(tempfile.gettempdir(), f"test_phase9_{os.getpid()}_{id(object())}.db")
     os.environ["DATABASE_URL"] = f"sqlite:///{tmp_path}"
 
     from app.core.config import get_settings
@@ -30,9 +27,15 @@ def isolated_db():
 
     yield db_module
 
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    try:
 
+        if os.path.exists(tmp_path):
+
+            os.remove(tmp_path)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
 def _seed_case_and_pattern_entry(db_module, db, case_num, cluster_key, matched):
     from app.core.db import ExceptionCase, CaseState
@@ -52,7 +55,6 @@ def _seed_case_and_pattern_entry(db_module, db, case_num, cluster_key, matched):
         case_feature_summary=f"Low-value return request, category apparel, case {case_num}",
         agent_proposed_resolution=proposed, human_final_resolution=final,
     )
-
 
 def test_ten_zero_overturn_cases_propose_raise_but_never_auto_apply(isolated_db):
     from app.agents.learning_loop import propose_threshold_adjustments, get_active_threshold
@@ -80,7 +82,6 @@ def test_ten_zero_overturn_cases_propose_raise_but_never_auto_apply(isolated_db)
     assert active == current_threshold, "The effective threshold must still be the original default, unchanged"
     db.close()
 
-
 def test_explicit_human_accept_is_required_to_create_an_override(isolated_db):
     from app.agents.learning_loop import propose_threshold_adjustments, accept_threshold_proposal, get_active_threshold
 
@@ -99,7 +100,6 @@ def test_explicit_human_accept_is_required_to_create_an_override(isolated_db):
     assert active == proposals[0].proposed_threshold, "After explicit accept, the override IS now effective"
     db.close()
 
-
 def test_accept_rejects_system_or_automated_identity(isolated_db):
     """The guardrail's other half: even the accept function itself refuses
     to be called on the system's own behalf."""
@@ -114,7 +114,6 @@ def test_accept_rejects_system_or_automated_identity(isolated_db):
         with pytest.raises(ValueError):
             accept_threshold_proposal(db, proposals[0].id, accepted_by=bad_identity)
     db.close()
-
 
 def test_cluster_with_overturns_proposes_lowering_threshold(isolated_db):
     """The mirror case: a cluster with real overturns should propose
@@ -131,7 +130,6 @@ def test_cluster_with_overturns_proposes_lowering_threshold(isolated_db):
     assert proposals[0].proposed_threshold < 0.90, "Nonzero overturn should propose LOWERING the threshold"
     db.close()
 
-
 def test_clusters_below_min_sample_size_produce_no_proposal(isolated_db):
     """Statistical caution: too few samples shouldn't move the threshold
     at all, in either direction."""
@@ -144,7 +142,6 @@ def test_clusters_below_min_sample_size_produce_no_proposal(isolated_db):
     proposals = propose_threshold_adjustments(db, current_threshold=0.90, min_sample_size=5)
     assert proposals == []
     db.close()
-
 
 def test_retrieve_similar_past_resolutions_ranks_by_relevance(isolated_db):
     from app.agents.learning_loop import record_resolution_outcome, retrieve_similar_past_resolutions
@@ -171,7 +168,6 @@ def test_retrieve_similar_past_resolutions_ranks_by_relevance(isolated_db):
     result_ids = {r.case_id for r in results}
     assert result_ids == {"case-a", "case-c"}
     db.close()
-
 
 def test_retrieve_similar_past_resolutions_empty_store_returns_empty(isolated_db):
     from app.agents.learning_loop import retrieve_similar_past_resolutions

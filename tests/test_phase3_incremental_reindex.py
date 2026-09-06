@@ -8,11 +8,9 @@ import shutil
 
 import pytest
 
-
 TEST_QDRANT_PATH = "data/qdrant_local_test_reindex"
 TEST_REINDEX_STATE = "data/reindex_state_test_reindex.json"
 TEST_POLICY_DIR = "data/policies_reindex_test"
-
 
 @pytest.fixture
 def isolated_env():
@@ -50,7 +48,6 @@ def isolated_env():
     if os.path.exists(TEST_REINDEX_STATE):
         os.remove(TEST_REINDEX_STATE)
 
-
 def _write_simple_policy_pdf(path: str, doc_id: str, body_sentence: str):
     from reportlab.lib.pagesizes import letter
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
@@ -66,7 +63,6 @@ def _write_simple_policy_pdf(path: str, doc_id: str, body_sentence: str):
     ]
     doc.build(story)
 
-
 def test_unchanged_corpus_reembeds_nothing_on_second_run(isolated_env):
     from app.rag.ingestion import ingest_policy_pdf
 
@@ -79,7 +75,6 @@ def test_unchanged_corpus_reembeds_nothing_on_second_run(isolated_env):
     second = ingest_policy_pdf(path)
     assert second["embedded_this_run"] == 0, "unchanged document should re-embed nothing"
     assert second["skipped_unchanged"] == first["total_nodes"]
-
 
 def test_only_modified_document_reembeds_others_stay_skipped(isolated_env):
     from app.rag.ingestion import ingest_policy_pdf

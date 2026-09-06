@@ -8,12 +8,9 @@ from datetime import datetime, timezone
 
 import pytest
 
-
 @pytest.fixture(autouse=True)
 def isolated_db():
-    tmp_path = os.path.join(tempfile.gettempdir(), "test_phase5.db")
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    tmp_path = os.path.join(tempfile.gettempdir(), f"test_phase5_{os.getpid()}_{id(object())}.db")
     os.environ["DATABASE_URL"] = f"sqlite:///{tmp_path}"
 
     from app.core.config import get_settings
@@ -26,9 +23,15 @@ def isolated_db():
 
     yield db_module
 
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+    try:
 
+        if os.path.exists(tmp_path):
+
+            os.remove(tmp_path)
+
+    except PermissionError:
+
+        pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
 def test_customer_history_returns_all_episodes_time_ordered(isolated_db):
     from app.memory.episodic import log_episode, get_customer_history
@@ -58,7 +61,6 @@ def test_customer_history_returns_all_episodes_time_ordered(isolated_db):
     assert history[2]["case_id"] == "case-2"   # January -- oldest
     db.close()
 
-
 def test_customer_history_filters_by_episode_type(isolated_db):
     from app.memory.episodic import log_episode, get_customer_history
 
@@ -74,7 +76,6 @@ def test_customer_history_filters_by_episode_type(isolated_db):
     assert only_fraud[0]["episode_type"] == "fraud_flag_raised"
     db.close()
 
-
 def test_history_does_not_leak_across_customers(isolated_db):
     from app.memory.episodic import log_episode, get_customer_history
 
@@ -87,7 +88,6 @@ def test_history_does_not_leak_across_customers(isolated_db):
     history_a = get_customer_history(db, "CUST-A")
     assert len(history_a) == 1
     db.close()
-
 
 def test_risk_profile_summarizes_returns_and_fraud_flags_separately(isolated_db):
     """Per architecture doc's explicit warning: return count alone must
@@ -110,7 +110,6 @@ def test_risk_profile_summarizes_returns_and_fraud_flags_separately(isolated_db)
     assert profile["fraud_flags_raised"] == 1
     db.close()
 
-
 # ---------------------------------------------------------------------------
 # Summary Buffer (short-term, per-case) tests
 # ---------------------------------------------------------------------------
@@ -125,7 +124,6 @@ def test_summary_buffer_keeps_recent_items_verbatim():
     assert len(ctx["recent_items"]) == 3
     assert ctx["running_summary"] == ""
 
-
 def test_summary_buffer_folds_oldest_items_when_overflowing():
     from app.memory.summary_buffer import SummaryBuffer
 
@@ -139,7 +137,6 @@ def test_summary_buffer_folds_oldest_items_when_overflowing():
     assert "step 2" in ctx["running_summary"]
     # most recent 2 stay verbatim
     assert ctx["recent_items"][-1]["summary"] == "step 4"
-
 
 def test_get_or_create_buffer_is_stable_per_case_id():
     from app.memory.summary_buffer import get_or_create_buffer, reset_buffers
