@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}Order Exception Agent{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body data-page="{{ page_id }}"{% block body_attrs %}{% endblock %}>
+  <div class="app-shell">
+    <nav class="rail">
+      <div class="rail-title">Order Exception<br>Agent</div>
+      <div class="rail-nav">
+        <a href="/" class="{{ 'active' if page_id == 'dashboard' else '' }}">Case Queue</a>
+        <a href="/escalations" class="{{ 'active' if page_id == 'escalations' else '' }}">Escalations</a>
+        <a href="/policies" class="{{ 'active' if page_id == 'policies' else '' }}">Policy Documents</a>
+        <a href="/metrics" class="{{ 'active' if page_id == 'metrics' else '' }}">Metrics</a>
+        <a href="/threshold-config" class="{{ 'active' if page_id == 'threshold' else '' }}">Threshold Config</a>
+        <a href="/audit-log" class="{{ 'active' if page_id == 'audit' else '' }}">Audit Log</a>
+      </div>
+    </nav>
+    <main class="content">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

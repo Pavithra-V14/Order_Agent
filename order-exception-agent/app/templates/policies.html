@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Policy Documents{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Policy Documents</h1>
+  <p>Upload new policy PDFs here. Existing versions are never overwritten -- upload under a new filename to add a new version.</p>
+</div>
+<div class="panel">
+  <h2>Upload a new policy document</h2>
+  <form id="upload-form">
+    <div class="form-group">
+      <label for="policy-file">PDF file</label>
+      <input type="file" id="policy-file" accept="application/pdf" required>
+    </div>
+    <button type="submit" class="primary">Upload &amp; queue for ingestion</button>
+  </form>
+</div>
+<div id="policies-list"><div class="empty-state">Loading...</div></div>
+{% endblock %}

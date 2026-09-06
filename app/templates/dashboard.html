@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Case Queue{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Case Queue</h1>
+  <p>All order exception cases, most recent first.</p>
+</div>
+<table>
+  <thead>
+    <tr><th>Case</th><th>Order</th><th>Customer</th><th>Type</th><th>State</th><th>Fraud</th><th>Created</th></tr>
+  </thead>
+  <tbody id="cases-tbody">
+    <tr><td colspan="7"><div class="empty-state">Loading...</div></td></tr>
+  </tbody>
+</table>
+{% endblock %}
