@@ -203,7 +203,10 @@ def _build_graphiti_client():
 
     if settings.neo4j_uri:
         from graphiti_core.driver.neo4j_driver import Neo4jDriver
-        driver = Neo4jDriver(uri=settings.neo4j_uri, user=settings.neo4j_user, password=settings.neo4j_password)
+        driver = Neo4jDriver(
+            uri=settings.neo4j_uri, user=settings.neo4j_user, password=settings.neo4j_password,
+            database=settings.neo4j_database,
+        )
     else:
         driver = _get_or_create_kuzu_driver(settings.kuzu_local_path)
 

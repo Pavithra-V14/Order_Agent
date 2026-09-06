@@ -96,6 +96,14 @@ class Settings(BaseSettings):
     neo4j_uri: str | None = None
     neo4j_user: str = "neo4j"
     neo4j_password: str | None = None
+    # Graphiti's Neo4jDriver defaults this to "neo4j" internally if not
+    # passed explicitly — but not every Aura instance actually uses that
+    # literal database name (confirmed directly: a real Aura Free
+    # instance returned "Neo.ClientError.Database.DatabaseNotFound...
+    # database 'neo4j' does not exist"). Check your Aura console's
+    # instance connection details for the actual database name if the
+    # default doesn't work, and override here.
+    neo4j_database: str = "neo4j"
     kuzu_local_path: str = "./data/kuzu_local"
 
     # --- Guardrail thresholds (Part 5, Phase 1's Architecture Decision Sheet) ---
