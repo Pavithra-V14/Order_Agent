@@ -1,6 +1,7 @@
 import os
 import shutil
 import json
+import time
 
 from fastapi import APIRouter, UploadFile, HTTPException
 
@@ -8,6 +9,34 @@ router = APIRouter(prefix="/policies", tags=["policies"])
 
 POLICY_UPLOAD_DIR = "data/policies"
 REINDEX_STATE_PATH = "data/reindex_state.json"
+
+
+def _ingest_with_retry(pdf_path: str, max_attempts: int = 3):
+    """Retries ingestion with short backoff before giving up — a real,
+    principled robustness improvement for "production enterprise level":
+    ingestion depends on real cloud services (Qdrant, and Mistral if
+    configured), and a single transient hiccup (a cold Qdrant Cloud
+    connection, a brief rate-limit) shouldn't force a person to manually
+    click "Retry ingestion" for something that would have succeeded on
+    its own a second later. Genuinely bad content (a malformed PDF that
+    can't be parsed) will fail identically on every attempt and still
+    surfaces as a real error after exhausting retries — this doesn't
+    mask real failures, only smooths over transient ones, matching the
+    same retry-then-fail-honestly principle already used for tool calls
+    via the circuit breaker.
+    """
+    from app.rag.ingestion import ingest_policy_pdf
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return ingest_policy_pdf(pdf_path)
+        except Exception as e:
+            last_error = e
+            if attempt < max_attempts:
+                from app.core.console_log import log_warning
+                log_warning("ingestion", f"attempt {attempt}/{max_attempts} failed for {pdf_path}: {e} — retrying")
+                time.sleep(0.5 * attempt)
+    raise last_error
 
 
 @router.get("")
@@ -77,9 +106,8 @@ async def upload_policy(file: UploadFile):
     with open(dest_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    from app.rag.ingestion import ingest_policy_pdf
     try:
-        summary = ingest_policy_pdf(dest_path)
+        summary = _ingest_with_retry(dest_path)
     except Exception as e:
         # Ingestion failed (e.g. the PDF doesn't match the expected
         # policy-header format) — the file stays on disk (so nothing is
@@ -92,3 +120,28 @@ async def upload_policy(file: UploadFile):
         )
 
     return {"filename": file.filename, "status": "indexed", "summary": summary}
+
+
+@router.post("/{filename}/reingest")
+def reingest_policy(filename: str):
+    """Retries ingestion for a file that's ALREADY on disk — the piece
+    that was missing entirely after making uploads synchronous: if
+    ingestion failed the first time (a malformed PDF, a transient RAG
+    backend issue), the file was correctly kept on disk rather than
+    lost, but there was no way to try again short of deleting it and
+    re-uploading under a different name, which defeats the point of
+    keeping the original filename. This works on the EXACT SAME file
+    already present — not a new upload, so the never-overwrite guard
+    (which exists to protect against silently replacing a DIFFERENT
+    version) doesn't apply here at all.
+    """
+    dest_path = os.path.join(POLICY_UPLOAD_DIR, filename)
+    if not os.path.exists(dest_path):
+        raise HTTPException(status_code=404, detail=f"No such file on disk: {filename}")
+
+    try:
+        summary = _ingest_with_retry(dest_path)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Re-ingestion of {filename} failed: {e}")
+
+    return {"filename": filename, "status": "indexed", "summary": summary}

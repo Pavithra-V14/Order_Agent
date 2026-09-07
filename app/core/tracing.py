@@ -164,7 +164,8 @@ def _push_to_langfuse(trace_id: str, name: str, input_data: dict, output_data: d
         # Never let an observability-layer failure break the traced
         # operation itself — logged, not raised.
         import logging
-        logging.getLogger("tracing").warning("Langfuse push failed (non-fatal): %s", e)
+        from app.core.console_log import log_warning
+        log_warning("langfuse", f"push failed (non-fatal, trace still recorded to SQL): {e}")
 
 
 _langfuse_client = None

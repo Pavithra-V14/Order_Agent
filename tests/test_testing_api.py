@@ -148,3 +148,98 @@ def test_golden_set_run_with_unknown_scenario_name_returns_clean_error(isolated_
             "label": "bad-selection", "scenario_names": ["scenario_does_not_exist"],
         })
         assert resp.status_code == 400
+
+
+def test_golden_set_subprocess_environment_is_isolated_from_real_cloud_credentials(isolated_db, monkeypatch):
+    """THE regression test for the actual production bug: a real
+    subprocess.TimeoutExpired after 60s on a real deployment, traced to
+    subprocess.run() inheriting the FULL parent environment by default —
+    a real GROQ_API_KEY/QDRANT_URL/NEO4J_URI configured for the live app
+    leaked into the golden-set subprocess, causing its
+    get_llm_client()/get_embedder()/get_qdrant_client() auto-selection
+    to silently pick real, slow cloud clients instead of the fast local
+    substitutes golden-set scenarios are designed around.
+
+    This test sets fake-but-real-LOOKING cloud credentials in THIS
+    process's environment (simulating a real .env-configured deployment)
+    and confirms the golden set still completes quickly and correctly —
+    proving the subprocess's environment is genuinely stripped of them,
+    not just hoping the scenarios happen to avoid using them.
+    """
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_fake_real_looking_key_for_isolation_test")
+    monkeypatch.setenv("QDRANT_URL", "https://fake-cloud-instance-for-isolation-test.qdrant.io")
+    monkeypatch.setenv("QDRANT_API_KEY", "fake_qdrant_key")
+
+    import time
+    from app.main import app
+    with TestClient(app) as client:
+        start = time.monotonic()
+        resp = client.post("/api/v1/testing/golden-set/run", json={"label": "isolation-test"})
+        elapsed = time.monotonic() - start
+
+    assert resp.status_code == 200
+    assert resp.json()["pass_count"] == resp.json()["total_count"] == 10
+    assert elapsed < 30, (
+        f"golden set took {elapsed:.1f}s with fake cloud credentials set in the parent process — "
+        f"if the subprocess isn't properly isolated, this hangs trying to reach a fake Qdrant URL "
+        f"or a fake Groq key instead of using fast local substitutes"
+    )
+
+
+def test_golden_set_subprocess_ignores_a_real_env_file_with_cloud_credentials(isolated_db):
+    """THE regression test for the DEEPER version of the same bug, found
+    after the fix above turned out to be incomplete: subprocess.run()'s
+    env= parameter only controls INHERITED environment variables — it
+    does nothing to stop the subprocess from independently reading a
+    real .env FILE from disk, since Settings.model_config specifies
+    env_file=".env" (a file path pydantic-settings reads directly, not
+    an environment variable). A real .env file sitting in the project
+    directory with real GROQ_API_KEY/NEO4J_URI leaked into the
+    golden-set subprocess regardless of the env-stripping fix, because
+    it was never inherited via os.environ in the first place — it was
+    read fresh, from disk, by the subprocess's own Settings() construction.
+
+    This test writes an ACTUAL .env file to the project root with fake
+    real-looking cloud credentials (exactly reproducing the reported
+    production crash) and confirms the golden set still completes
+    correctly and quickly despite it.
+    """
+    env_path = ".env"
+    env_already_existed = os.path.exists(env_path)
+    original_content = None
+    if env_already_existed:
+        with open(env_path) as f:
+            original_content = f.read()
+
+    try:
+        with open(env_path, "w") as f:
+            f.write(
+                "GROQ_API_KEY=gsk_real_looking_fake_key_from_dotenv_file\n"
+                "NEO4J_URI=neo4j+s://fake-real-looking-instance.databases.neo4j.io\n"
+                "NEO4J_PASSWORD=fake_password\n"
+            )
+
+        import time
+        from app.main import app
+        with TestClient(app) as client:
+            start = time.monotonic()
+            resp = client.post("/api/v1/testing/golden-set/run", json={"label": "dotenv-isolation-test"})
+            elapsed = time.monotonic() - start
+
+        assert resp.status_code == 200
+        assert resp.json()["pass_count"] == resp.json()["total_count"] == 10, (
+            f"expected all 10 scenarios to pass despite a real .env file with fake cloud creds "
+            f"present — got {resp.json()}"
+        )
+        assert elapsed < 30, (
+            f"golden set took {elapsed:.1f}s with a real .env file containing fake cloud "
+            f"credentials present in the project directory — if the subprocess script doesn't "
+            f"disable its OWN .env file reading, it picks these up directly from disk regardless "
+            f"of what was or wasn't inherited via os.environ"
+        )
+    finally:
+        if env_already_existed:
+            with open(env_path, "w") as f:
+                f.write(original_content)
+        elif os.path.exists(env_path):
+            os.remove(env_path)

@@ -48,3 +48,15 @@ def log_rag_retrieval(query: str, num_results: int, doc_type: str = None) -> Non
     results came back, visible live rather than only in a trace query."""
     filt = f" doc_type={doc_type}" if doc_type else ""
     _logger.info(f"RAG    retrieval query={query!r}{filt} -> {num_results} results")
+
+
+def log_warning(source: str, message: str) -> None:
+    """A non-fatal problem worth seeing immediately in the terminal —
+    e.g. a Langfuse push failing. Used instead of Python's plain
+    `logging` module for exactly this class of message so it's
+    genuinely visible by default: a bare `logging.getLogger(...).warning()`
+    call with no handler configured can print nothing at all depending
+    on the app's overall logging setup, silently hiding a failure that
+    someone actively debugging (e.g. "why isn't anything showing up in
+    Langfuse") needs to actually see."""
+    _logger.warning(f"{source.upper()}  {message}")

@@ -218,10 +218,33 @@ def compute_rag_metrics(db: Session) -> dict:
         "retrieval_hit_rate": retrieval_hit_rate,
         "citing_decision_count": total_citing_decisions,
         "groundedness_score": groundedness_score,
+        # Explicit aliases requested directly: "faithfulness" is the
+        # standard RAG-evaluation term for exactly what groundedness_score
+        # already measures here (does the citation match what was
+        # actually retrieved) — not a new computation, a clearer name for
+        # the same real number. "hallucination_rate" is its complement:
+        # the fraction of citing decisions that referenced something
+        # NOT actually retrieved in the same case's trace, i.e. the
+        # model asserting a source it never actually looked at.
+        "faithfulness_score": groundedness_score,
+        "hallucination_rate": round(1 - groundedness_score, 3) if groundedness_score is not None else None,
         "per_case_groundedness": per_case_groundedness,
-        # See module docstring: precision/recall@k, reranker lift, and
-        # index freshness lag all require new instrumentation/eval
-        # artifacts not yet built.
+        # Precision/recall for LIVE traffic are deliberately NOT computed
+        # here, and this isn't an instrumentation gap — it's a genuine
+        # conceptual one. Precision/recall require knowing which
+        # documents SHOULD have been retrieved for a given real
+        # production query, which nobody has hand-labeled for actual
+        # case traffic (unlike the offline eval set in app/rag/eval.py,
+        # which exists specifically because someone DID label expected
+        # answers for a fixed set of test queries). Reporting a live
+        # "precision" number here would require either fabricating
+        # ground truth or silently reusing the offline eval's numbers
+        # and mislabeling them as live — both worse than being honest
+        # that this needs human-labeled relevance judgments on real
+        # traffic to ever be a real number. See GET /testing/rag-eval
+        # for the real, defensible precision/recall measurement this
+        # project has: computed against actual labeled ground truth,
+        # just not "live" in the sense of reflecting production queries.
     }
 
 

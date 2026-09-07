@@ -255,6 +255,47 @@ def run_full_case_pipeline(
     from app.agents.resolution_policy_workflow import run_resolution_policy_workflow
     from app.core.db import ExceptionCase, CaseState
 
+    # THE previously-missing piece: this function used to accept
+    # retrieved_policy_doc_id/version as PARAMETERS, meaning nothing in
+    # the real pipeline ever actually called RAG retrieval at all — a
+    # caller had to already know which policy applied and hand it in
+    # directly (scripts/full_pipeline_demo.py hardcoded it literally).
+    # Found from a live deployment's own metrics: retrieval span count
+    # sat at 0 while citing decisions sat at 3 — the resolution workflow
+    # was citing policies with nothing ever having actually searched for
+    # them, so groundedness could only ever report 0, correctly, for
+    # exactly that reason. This block makes the pipeline actually
+    # retrieve the applicable policy via a real, traced RAG call.
+    if retrieved_policy_doc_id is None:
+        case_for_query = db.get(ExceptionCase, case_id)
+        from app.tools.oms import get_order
+        order_for_query = get_order(db, order_id)
+        purchase_date = order_for_query["purchase_date"] if order_for_query else None
+        if purchase_date and "T" in purchase_date:
+            # get_order() returns a full ISO datetime string
+            # ("2025-06-15T00:00:00"), but hybrid_search's as_of_date
+            # expects a plain date ("2025-06-15") — confirmed as a real
+            # bug by actually running this end to end, not assumed:
+            # date.fromisoformat() inside build_temporal_filter() cannot
+            # parse the full datetime form.
+            purchase_date = purchase_date.split("T")[0]
+        product_category = None
+        if order_for_query and order_for_query.get("line_items"):
+            product_category = order_for_query["line_items"][0].get("category")
+
+        doc_type = "fraud_policy" if bool(diagnosis_state["fraud_result"]["flag"]) else "return_policy"
+        query_text = "fraud risk assessment" if doc_type == "fraud_policy" else "return window policy"
+
+        if purchase_date:
+            from app.rag.traced_retrieval import traced_hybrid_search
+            retrieval_results = traced_hybrid_search(
+                db, trace_id=case_id, query=query_text, as_of_date=purchase_date,
+                doc_type=doc_type, product_category=product_category, top_k=1,
+            )
+            if retrieval_results:
+                retrieved_policy_doc_id = retrieval_results[0].metadata.get("doc_id")
+                retrieved_policy_version = retrieval_results[0].metadata.get("version")
+
     result = run_resolution_policy_workflow(
         diagnosis_root_causes=diagnosis_state["diagnosis_root_causes"],
         inventory_result=diagnosis_state["inventory_result"],

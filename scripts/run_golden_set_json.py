@@ -22,6 +22,27 @@ import json
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# CRITICAL: disable Settings' real .env file reading BEFORE any other
+# import — found necessary as the actual root cause of a real production
+# crash: stripping cloud-credential env vars from this subprocess's
+# inherited environment (a fix applied earlier, in
+# app/api/v1/testing.py) does NOT stop pydantic-settings from
+# independently reading the real .env FILE FROM DISK, since
+# Settings.model_config specifies env_file=".env" — a file path, not an
+# environment variable, so it's read completely independent of what
+# was or wasn't inherited via os.environ. This subprocess sits in the
+# same project directory as the real .env file regardless of how it's
+# invoked (via the API's subprocess.run(), or a person running it
+# directly from a terminal), so it would otherwise pick up real
+# GROQ_API_KEY/NEO4J_URI/etc. on its own and make real, slow cloud
+# calls — exactly what caused a real golden-set scenario to crash with
+# a Graphiti timeout even after the env-stripping fix. This mirrors
+# tests/conftest.py's identical fix for pytest, applied here because
+# this script runs as its own separate process that conftest.py's
+# session-scoped fixture never touches.
+from app.core.config import Settings
+Settings.model_config["env_file"] = None
+
 from tests.golden_set import ALL_SCENARIOS
 
 

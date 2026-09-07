@@ -171,3 +171,101 @@ def test_escalated_case_is_not_completed(isolated_db):
         "log_episode must NOT fire for a case that hasn't actually resolved yet"
     )
     db.close()
+
+
+def test_full_pipeline_actually_calls_real_rag_retrieval_when_no_doc_id_given(isolated_db):
+    """THE regression test for a real production gap found from a live
+    deployment's own metrics: retrieval span count sat at 0 while citing
+    decisions sat at 3 — run_full_case_pipeline previously REQUIRED the
+    caller to already know which policy applied (via the
+    retrieved_policy_doc_id parameter) rather than ever actually calling
+    RAG retrieval itself. scripts/full_pipeline_demo.py hardcoded the
+    doc_id literally, so nothing about the "full pipeline" ever actually
+    searched for anything — groundedness could only ever report 0 for
+    exactly that reason, correctly, since nothing was ever retrieved to
+    confirm a citation against.
+
+    This test omits retrieved_policy_doc_id entirely and confirms the
+    pipeline derives it via a REAL hybrid_search call, produces an
+    actual rag_retrieval trace span, and ends up with a groundedness
+    score that reflects reality rather than always being 0.
+    """
+    import shutil
+    tmp_qdrant = tempfile.mkdtemp(prefix="test_rag_wiring_qdrant_")
+    tmp_reindex_state = os.path.join(tempfile.gettempdir(), f"test_rag_wiring_reindex_{os.getpid()}.json")
+    os.environ["QDRANT_LOCAL_PATH"] = tmp_qdrant
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+    import app.rag.vectorstore as vectorstore_module
+    if vectorstore_module._client_singleton is not None:
+        vectorstore_module._client_singleton.close()
+    vectorstore_module._client_singleton = None
+    vectorstore_module._client_singleton_key = None
+
+    # Isolate the reindex-state tracker too — without this, the
+    # incremental-reindex logic reads the REAL data/reindex_state.json,
+    # sees these documents already indexed (same content hash) from a
+    # prior real ingestion run, and skips embedding them entirely —
+    # leaving this test's fresh, empty Qdrant collection with zero
+    # points despite ingest_policy_directory() appearing to "succeed".
+    # Confirmed as the actual cause by hitting exactly the resulting
+    # symptom (TfidfEmbedder unfit) before adding this isolation.
+    import app.rag.ingestion as ingestion_module
+    ingestion_module._REINDEX_STATE_PATH = tmp_reindex_state
+
+    from app.rag.ingestion import ingest_policy_directory
+    ingest_policy_directory("data/policies")
+
+    from app.core.db import SessionLocal, ExceptionCase, CaseState
+    from app.tools.oms import create_order
+    from app.tools.wms import seed_stock
+    from app.tools.payment import get_payment_gateway
+    from app.agents.orchestrator import run_full_case_pipeline
+    from app.core.metrics import compute_rag_metrics
+
+    db = SessionLocal()
+    try:
+        create_order(db, order_id="ORD-RAG-WIRING", customer_id="CUST-RAG-WIRING", channel="direct",
+                     status="payment_failed", total_amount_usd=45.0,
+                     purchase_date=datetime(2025, 6, 15, tzinfo=timezone.utc),
+                     line_items=[{"sku": "SKU-RAG-WIRING", "category": "apparel", "qty": 1, "price": 45.0}],
+                     payment_intent_id="pi_rag_wiring")
+        get_payment_gateway().seed_transaction("pi_rag_wiring", amount_usd=45.0, status="declined")
+        seed_stock(db, sku="SKU-RAG-WIRING", warehouse="WH-A", on_hand_qty=5, sellable_qty=5)
+
+        case = ExceptionCase(id="case-rag-wiring", order_id="ORD-RAG-WIRING", customer_id="CUST-RAG-WIRING",
+                              channel="direct", exception_type="payment", state=CaseState.DETECTED)
+        db.add(case)
+        db.commit()
+
+        # Deliberately NOT passing retrieved_policy_doc_id/version at all —
+        # this is the exact call shape that previously resulted in zero
+        # retrieval and zero groundedness regardless of what actually happened.
+        result = run_full_case_pipeline(
+            db, case_id="case-rag-wiring", order_id="ORD-RAG-WIRING", customer_id="CUST-RAG-WIRING",
+            order_amount_usd=45.0, auto_execute_confidence_threshold=0.90,
+            auto_execute_value_ceiling_usd=50.0, payment_intent_id="pi_rag_wiring",
+        )
+
+        assert result["routing"] == "auto_execute"
+
+        metrics = compute_rag_metrics(db)
+        assert metrics["retrieval_span_count"] >= 1, (
+            "a real rag_retrieval trace span must exist — this is the exact thing that was "
+            "missing entirely before, regardless of whether the citation was 'correct'"
+        )
+        assert metrics["groundedness_score"] == 1.0, (
+            "the citation must be genuinely grounded in what was actually retrieved, not just "
+            "coincidentally non-zero"
+        )
+    finally:
+        db.close()
+        if vectorstore_module._client_singleton is not None:
+            vectorstore_module._client_singleton.close()
+        vectorstore_module._client_singleton = None
+        vectorstore_module._client_singleton_key = None
+        os.environ.pop("QDRANT_LOCAL_PATH", None)
+        get_settings.cache_clear()
+        shutil.rmtree(tmp_qdrant, ignore_errors=True)
+        if os.path.exists(tmp_reindex_state):
+            os.remove(tmp_reindex_state)

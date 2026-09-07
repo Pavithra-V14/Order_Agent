@@ -160,12 +160,14 @@ async function initPolicies() {
       const info = (data.file_status || {})[f] || {};
       const statusCell = indexed
         ? badge('indexed', 'resolved')
-        : badge('not indexed', 'blocked') + '<div class="rationale-text">' + esc(info.detail || '') + '</div>';
+        : badge('not indexed', 'blocked') + '<div class="rationale-text">' + esc(info.detail || '') + '</div>' +
+          '<button style="margin-top:4px;" onclick="retryIngestion(\'' + esc(f) + '\')">Retry ingestion</button>';
       return '<tr><td class="id">' + esc(f) + '</td><td>' + statusCell + '</td></tr>';
     }).join('');
     root.innerHTML = '<table><thead><tr><th>File</th><th>Indexed</th></tr></thead><tbody>' + rows + '</tbody></table>';
   }
   await render();
+  window._reloadPolicies = render;
 
   document.getElementById('upload-form').addEventListener('submit', async function (ev) {
     ev.preventDefault();
@@ -184,6 +186,18 @@ async function initPolicies() {
       toast('Error: ' + e.message, true);
     }
   });
+}
+
+async function retryIngestion(filename) {
+  try {
+    const resp = await fetch('/api/v1/policies/' + encodeURIComponent(filename) + '/reingest', { method: 'POST' });
+    const body = await resp.json();
+    if (!resp.ok) throw new Error(body.detail || 'Retry failed');
+    toast('Indexed: ' + body.filename);
+    if (window._reloadPolicies) await window._reloadPolicies();
+  } catch (e) {
+    toast('Error: ' + e.message, true);
+  }
 }
 
 async function initMetrics() {
