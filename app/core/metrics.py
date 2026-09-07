@@ -4,28 +4,29 @@ ExceptionCase, IdempotencyRecord, AuditLogEntry, and AlertRecord.
 
 HONEST STATUS (found and documented directly, not glossed over): the
 guide's Part 8.7 lists ~23 distinct named metrics across 4 categories.
-This file originally implemented about 6 of them. Fixed here to add
-every metric computable from data ALREADY being collected (no new
-instrumentation needed) — but several genuinely require either new
+This file originally implemented about 6 of them, then per-tool
+failure/latency/read-write-ratio were added once tool-call tracing
+existed. Precision/recall@k now lives separately in app/rag/eval.py +
+GET /testing/rag-eval (a live eval against a labeled query set, not a
+passively-computed metric from historical trace data — it belongs with
+the Testing page's other on-demand checks, not mixed into this file's
+passive metrics). Several metrics below genuinely require either new
 instrumentation this build hasn't added yet, or external business inputs
 this system has no way to know on its own. Both kinds are named
 explicitly below, not silently dropped.
 
 STILL MISSING, and why:
-- Per-tool failure rate/latency, tool selection accuracy, tool-call
-  argument validity rate, read/write ratio: requires wrapping every
-  individual tool call (payment.py, wms.py, carrier.py, oms.py) in its
-  own record_span() — currently only resolution_policy_workflow.py
-  calls record_span() directly. Real, scoped follow-up: add tracing at
-  the tool-wrapper layer, not a metrics-file problem.
-- Precision/recall @k on a golden policy-QA set: needs labeled
-  query->expected-doc_id pairs in a specific shape the golden set
-  (tests/golden_set.py) doesn't currently define — needs a genuine new
-  eval artifact, not just a new metrics query.
-- Reranker lift, index freshness lag: needs the retrieval pipeline to
-  record pre-rerank AND post-rerank scores, and the ingestion pipeline
-  to record an upload-to-searchable timestamp — neither currently
-  captured.
+- Tool selection accuracy, tool-call argument validity rate: these
+  specifically (NOT per-tool failure rate/latency/read-write ratio,
+  which ARE now computed below) require ground-truth labeling of
+  whether the RIGHT tool was chosen and whether arguments were CORRECT
+  for the situation — a call can succeed with the wrong tool chosen, or
+  fail with the right tool for an unrelated reason, so success/failure
+  alone can't answer either question.
+- Reranker lift and index freshness lag are NO LONGER missing — see
+  GET /testing/reranker-lift (pre/post-rerank rank comparison via
+  hybrid_search's pre_rerank_capture hook) and GET /testing/index-freshness
+  (computed from reindex_state.json's own indexed_at/source_mtime timestamps).
 - Guardrail trigger accuracy (false positive/negative rate): requires
   ground-truth human feedback on whether each block/escalate was
   CORRECT, which is inherently a human-review data source, not
@@ -107,13 +108,56 @@ def compute_tool_metrics(db: Session) -> dict:
     circuit_trips = db.query(AlertRecord).filter(AlertRecord.event_type == "circuit_breaker_trip").count()
     idempotency_collisions = db.query(AlertRecord).filter(AlertRecord.event_type == "idempotency_collision").count()
 
+    # Per-tool failure rate/latency + read/write ratio — the previously
+    # missing metrics, now computable now that every real tool call
+    # (payment/wms/carrier/oms) is traced via record_tool_call(), not
+    # just resolution_policy_workflow's own single span.
+    tool_spans = db.query(TraceSpanRecord).filter(TraceSpanRecord.agent_or_tool_name.like("tool:%")).all()
+    per_tool = {}
+    for s in tool_spans:
+        name = s.agent_or_tool_name[len("tool:"):]
+        meta = s.span_metadata or {}
+        bucket = per_tool.setdefault(name, {"calls": 0, "failures": 0, "latencies_ms": [], "is_write": meta.get("is_write", False)})
+        bucket["calls"] += 1
+        if meta.get("status") == "failed":
+            bucket["failures"] += 1
+        if meta.get("latency_ms") is not None:
+            bucket["latencies_ms"].append(meta["latency_ms"])
+
+    per_tool_summary = {}
+    total_read_calls = 0
+    total_write_calls = 0
+    for name, bucket in per_tool.items():
+        latencies = bucket["latencies_ms"]
+        per_tool_summary[name] = {
+            "call_count": bucket["calls"],
+            "failure_rate": (bucket["failures"] / bucket["calls"]) if bucket["calls"] else 0.0,
+            "avg_latency_ms": round(sum(latencies) / len(latencies), 2) if latencies else None,
+            "is_write": bucket["is_write"],
+        }
+        if bucket["is_write"]:
+            total_write_calls += bucket["calls"]
+        else:
+            total_read_calls += bucket["calls"]
+
+    total_tool_calls = total_read_calls + total_write_calls
+    read_write_ratio = (total_read_calls / total_write_calls) if total_write_calls else None
+
     return {
         "successful_write_calls_by_tool": idempotency_by_tool,
         "circuit_breaker_trip_count": circuit_trips,
         "idempotency_collision_count": idempotency_collisions,
-        # See module docstring: per-tool failure rate/latency, tool
-        # selection accuracy, argument validity rate, and read/write
-        # ratio all require per-tool-call tracing not yet added.
+        "per_tool_metrics": per_tool_summary,
+        "total_tool_calls": total_tool_calls,
+        "read_call_count": total_read_calls,
+        "write_call_count": total_write_calls,
+        "read_write_ratio": round(read_write_ratio, 2) if read_write_ratio is not None else None,
+        # Tool selection accuracy and argument validity rate still
+        # require ground-truth labeling (was the RIGHT tool chosen for
+        # this situation, were these the CORRECT arguments) that isn't
+        # computable from call success/failure alone — a call can
+        # succeed with the wrong tool, or fail with the right one for
+        # an unrelated reason. Not computed here, not faked.
     }
 
 

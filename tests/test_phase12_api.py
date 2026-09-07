@@ -179,13 +179,55 @@ def test_policy_upload_never_overwrites(client_and_db):
         os.remove(upload_path)
 
     resp1 = client.post("/api/v1/policies/upload", files={"file": (fname, pdf_content, "application/pdf")})
-    assert resp1.status_code == 202
+    # Ingestion now runs synchronously (see app/api/v1/policies.py's
+    # docstring for why) — this fake, unparseable PDF content correctly
+    # fails ingestion (422), but the FILE ITSELF is still written to
+    # disk before that failure, which is what this test actually cares
+    # about: the overwrite guarantee below, not successful ingestion of
+    # deliberately-fake content.
+    assert resp1.status_code in (200, 422)
+    assert os.path.exists(upload_path), "the file must be saved to disk even if ingestion of its content fails"
 
     resp2 = client.post("/api/v1/policies/upload", files={"file": (fname, pdf_content, "application/pdf")})
     assert resp2.status_code == 409, "re-uploading the same filename must be rejected, never silently overwritten"
 
     if os.path.exists(upload_path):
         os.remove(upload_path)
+
+
+def test_policy_upload_with_real_content_ingests_synchronously(client_and_db):
+    """THE regression test for the actual architectural fix: uploading a
+    REAL, valid policy PDF must return a successful, INDEXED result
+    immediately in the HTTP response — no job_id, no polling, no
+    dependency on a background worker being alive. This is the fix for
+    a real, repeatedly-reported production issue: uploads via the UI
+    previously sat at "pending" forever whenever REDIS_URL was
+    configured but scripts/run_rq_worker.py wasn't separately running."""
+    client, _ = client_and_db
+
+    real_pdf_path = os.path.join("data", "policies", "RET-POLICY-2025-A.pdf")
+    if not os.path.exists(real_pdf_path):
+        import pytest
+        pytest.skip("real seeded policy PDF not present in this environment")
+
+    with open(real_pdf_path, "rb") as f:
+        real_pdf_bytes = f.read()
+
+    fname = "TEST-SYNC-UPLOAD-REAL.pdf"
+    upload_path = os.path.join("data", "policies", fname)
+    if os.path.exists(upload_path):
+        os.remove(upload_path)
+
+    try:
+        resp = client.post("/api/v1/policies/upload", files={"file": (fname, real_pdf_bytes, "application/pdf")})
+        assert resp.status_code == 200, f"expected synchronous success, got {resp.status_code}: {resp.text}"
+        data = resp.json()
+        assert data["status"] == "indexed"
+        assert "job_id" not in data, "the response must not reference a job at all — ingestion already happened"
+        assert data["summary"]["doc_id"]
+    finally:
+        if os.path.exists(upload_path):
+            os.remove(upload_path)
 
 def test_reopen_requires_resolved_state(client_and_db):
     client, db_module = client_and_db

@@ -24,7 +24,7 @@ def test_drift_check_with_no_baseline_reports_that_clearly(isolated_baseline):
 
 def test_establish_baseline_then_stable_check(isolated_baseline):
     baseline = isolated_baseline.establish_baseline()
-    assert baseline["pass_count"] == 8
+    assert baseline["pass_count"] == 10
     assert os.path.exists(isolated_baseline.BASELINE_PATH)
 
     result = isolated_baseline.run_drift_check()
@@ -51,6 +51,8 @@ def test_drift_check_detects_a_real_regression(isolated_baseline, monkeypatch):
             ScenarioResult("tier1_hard_block", True, "ok"),
             ScenarioResult("circuit_breaker_fails_fast", True, "ok"),
             ScenarioResult("webhook_cache_invalidation", True, "ok"),
+            ScenarioResult("idempotency_key_reuse_with_different_args_raises", True, "ok"),
+            ScenarioResult("pii_redacted_before_trace_persist", True, "ok"),
         ]
 
     monkeypatch.setattr(dw, "run_golden_set", fake_run_golden_set_with_regression)

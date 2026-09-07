@@ -313,6 +313,70 @@ def scenario_webhook_cache_invalidation() -> ScenarioResult:
     return ScenarioResult("webhook_cache_invalidation", passed,
                            f"sellable_qty_after_webhook={second_read[0]['sellable_qty']}")
 
+def scenario_idempotency_key_reuse_with_different_args_raises() -> ScenarioResult:
+    """Edge case: an idempotency key gets reused for a DIFFERENT request
+    (different amount, different tool). Must raise cleanly, never
+    silently re-execute or return a mismatched cached result — a
+    financial-safety requirement, not just a correctness nicety."""
+    db_module, tmp_path = _fresh_db("idempotency_reuse")
+    db = db_module.SessionLocal()
+    from app.tools.idempotency import with_idempotency, IdempotencyKeyReusedWithDifferentArgs
+
+    with_idempotency(db, "golden-reuse-key", "payment_refund", {"amount": 42.0},
+                      execute_fn=lambda: {"id": "re_1", "amount": 42.0})
+
+    raised = False
+    try:
+        with_idempotency(db, "golden-reuse-key", "payment_refund", {"amount": 999.0},
+                          execute_fn=lambda: {"id": "re_2", "amount": 999.0})
+    except IdempotencyKeyReusedWithDifferentArgs:
+        raised = True
+
+    db.close()
+    try:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    except PermissionError:
+        pass
+
+    return ScenarioResult("idempotency_key_reuse_with_different_args_raises", raised,
+                           f"raised_on_mismatched_reuse={raised}")
+
+
+def scenario_pii_redacted_before_trace_persist() -> ScenarioResult:
+    """Edge case: a case's diagnosis/resolution data contains PII (an
+    email address embedded in free-text reasoning) — must be redacted
+    BEFORE being persisted to a trace span, since a trace record is a
+    permanent log that can't be safely scrubbed retroactively with the
+    same confidence."""
+    db_module, tmp_path = _fresh_db("pii_redaction")
+    db = db_module.SessionLocal()
+    from app.core.tracing import record_span, get_trace
+
+    record_span(
+        db, trace_id="case-golden-pii", agent_or_tool_name="resolution_decision",
+        input_data={"customer_note": "Please contact me at jane.doe@example.com about this"},
+        output_data={"action": "refund"},
+        metadata={},
+    )
+    spans = get_trace(db, "case-golden-pii")
+    db.close()
+    try:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    except PermissionError:
+        pass
+
+    persisted_note = spans[0]["input"].get("customer_note", "") if spans else ""
+    email_leaked = "jane.doe@example.com" in persisted_note
+    redaction_marker_present = "REDACTED" in persisted_note
+    passed = (not email_leaked) and redaction_marker_present
+
+    return ScenarioResult("pii_redacted_before_trace_persist", passed,
+                           f"email_leaked={email_leaked}, redaction_marker_present={redaction_marker_present}, "
+                           f"persisted_value={persisted_note!r}")
+
+
 ALL_SCENARIOS = [
     scenario_temporal_policy_correctness,
     scenario_duplicate_refund_idempotency,
@@ -322,6 +386,8 @@ ALL_SCENARIOS = [
     scenario_tier1_hard_block,
     scenario_circuit_breaker_fails_fast,
     scenario_webhook_cache_invalidation,
+    scenario_idempotency_key_reuse_with_different_args_raises,
+    scenario_pii_redacted_before_trace_persist,
 ]
 
 def run_golden_set():

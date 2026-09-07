@@ -21,8 +21,10 @@ with "AttributeError: module 'os' has no attribute 'fork'" (confirmed
 directly on a real Windows machine before this fix). SimpleWorker runs
 each job in the same process instead — slightly less isolation between
 jobs (a crashing job could theoretically affect the worker process
-itself), an acceptable tradeoff for this project's job types (webhook
-handlers, policy ingestion), which don't need per-job process isolation,
+itself), an acceptable tradeoff for this project's remaining
+queue-backed job types (OMS/inventory/carrier webhooks — policy
+ingestion runs synchronously inside the upload request itself now, not
+through this queue at all), which don't need per-job process isolation,
 and the only option that works identically on Windows, macOS, and Linux.
 """
 import sys
@@ -53,7 +55,11 @@ def main():
         "process_oms_webhook": handlers.handle_oms_webhook,
         "process_inventory_webhook": handlers.handle_inventory_webhook,
         "process_carrier_webhook": handlers.handle_carrier_webhook,
-        "process_policy_upload": handlers.handle_policy_upload,
+        # process_policy_upload was removed: policy ingestion now runs
+        # SYNCHRONOUSLY inside the upload HTTP request itself (see
+        # app/api/v1/policies.py's docstring for why) — it never goes
+        # through the job queue at all anymore, so there's no handler
+        # to register for it here.
     }
     print(f"Starting RQ worker for queue '{RQJobQueue.QUEUE_NAME}', handlers: {list(handler_map)}")
 

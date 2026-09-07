@@ -17,7 +17,7 @@ def test_golden_set_all_scenarios_pass():
     results = run_golden_set()
     failed = [r for r in results if not r.passed]
     assert not failed, f"Golden set failures: {[(r.name, r.detail) for r in failed]}"
-    assert len(results) == len(ALL_SCENARIOS) == 8
+    assert len(results) == len(ALL_SCENARIOS) == 10
 
 def test_golden_set_includes_the_three_mandatory_scenarios():
     """Per the build checklist's Phase 15 DoD: the golden set must include
@@ -45,6 +45,6 @@ def test_golden_set_is_deterministic_across_three_runs():
         results = run_golden_set()
         pass_counts.append(sum(1 for r in results if r.passed))
 
-    assert pass_counts == [8, 8, 8], (
-        f"Expected identical 8/8 pass counts across all 3 runs, got {pass_counts}"
+    assert pass_counts == [10, 10, 10], (
+        f"Expected identical 10/10 pass counts across all 3 runs, got {pass_counts}"
     )

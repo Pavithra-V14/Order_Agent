@@ -10,7 +10,6 @@ import uuid
 
 from app.core.db import ExceptionCase, CaseState, AuditLogEntry
 from app.tools import oms, wms as wms_tool, carrier as carrier_tool
-from app.rag.ingestion import ingest_policy_pdf
 
 _EXCEPTION_TRIGGERING_STATUSES = {"payment_failed", "delivery_exception", "return_requested"}
 
@@ -89,8 +88,3 @@ def handle_carrier_webhook(payload: dict) -> dict:
         finally:
             db.close()
     return result
-
-
-def handle_policy_upload(payload: dict) -> dict:
-    """payload: {pdf_path}"""
-    return ingest_policy_pdf(payload["pdf_path"])

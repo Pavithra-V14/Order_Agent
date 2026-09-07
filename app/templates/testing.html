@@ -1,0 +1,195 @@
+{% extends "base.html" %}
+{% block title %}Testing{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Testing — Golden Set</h1>
+  <p>Fixed regression scenarios covering temporal policy correctness, idempotency, fraud vs. high-LTV customer, multi-cause diagnosis, and more. Runs in an isolated subprocess — kept deliberately separate from Live Metrics, which reflects real production traffic instead.</p>
+</div>
+
+<div class="panel" style="max-width:640px; margin-bottom:20px;">
+  <h2>Select Scenarios</h2>
+  <div id="scenario-checkboxes" class="rationale-text">Loading scenarios...</div>
+  <div style="margin:10px 0;">
+    <a href="#" onclick="selectAllScenarios(true); return false;">Select all</a>
+    &nbsp;·&nbsp;
+    <a href="#" onclick="selectAllScenarios(false); return false;">Select none</a>
+  </div>
+  <form id="golden-set-run-form" style="display:flex; gap:8px;">
+    <input type="text" id="run-label" placeholder="Label this run (e.g. 'before fix', 'v2 deploy')" required style="flex:1;">
+    <button type="submit" class="primary">Run Selected</button>
+  </form>
+  <div id="run-in-progress" class="rationale-text" style="display:none; margin-top:8px;">Running selected scenarios in an isolated subprocess (a few seconds)...</div>
+</div>
+
+<div class="panel" style="max-width:640px; margin-bottom:20px;">
+  <h2>Index Freshness Lag</h2>
+  <p class="rationale-text">Time between a policy document's own file timestamp and when it actually became searchable.</p>
+  <button id="btn-check-freshness" class="primary">Check Freshness</button>
+  <div id="freshness-result" style="margin-top:12px;"></div>
+</div>
+
+<div class="panel" style="max-width:640px; margin-bottom:20px;">
+  <h2>Reranker Lift</h2>
+  <p class="rationale-text">How much does reranking move the correct document up in rank, compared to dense+sparse fusion alone?</p>
+  <button id="btn-run-lift" class="primary">Check Reranker Lift</button>
+  <div id="lift-result" style="margin-top:12px;"></div>
+</div>
+
+<div class="panel" style="max-width:640px; margin-bottom:20px;">
+  <h2>RAG Precision/Recall Eval</h2>
+  <p class="rationale-text">Runs a small, hand-labeled set of queries against the live retrieval pipeline and checks whether the correct document actually comes back.</p>
+  <button id="btn-run-rag-eval" class="primary">Run RAG Eval</button>
+  <div id="rag-eval-result" style="margin-top:12px;"></div>
+</div>
+
+<h2 style="font-size:15px; margin:24px 0 12px;">Run History</h2>
+<table>
+  <thead>
+    <tr><th>Label</th><th>Run At</th><th>Result</th><th></th></tr>
+  </thead>
+  <tbody id="runs-tbody">
+    <tr><td colspan="4"><div class="empty-state">Loading...</div></td></tr>
+  </tbody>
+</table>
+
+<div id="run-detail-panel" style="margin-top:24px; display:none;">
+  <h2 style="font-size:15px; margin-bottom:12px;">Scenario Detail — <span id="run-detail-label"></span></h2>
+  <table>
+    <thead><tr><th>Scenario</th><th>Result</th><th>Detail</th></tr></thead>
+    <tbody id="run-detail-tbody"></tbody>
+  </table>
+</div>
+
+<script>
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+}); }
+function badge(text, cls) { return '<span class="badge ' + cls + '">' + esc(text) + '</span>'; }
+
+async function loadScenarioCheckboxes() {
+  const resp = await fetch('/api/v1/testing/golden-set/scenarios');
+  const scenarios = await resp.json();
+  const root = document.getElementById('scenario-checkboxes');
+  root.innerHTML = scenarios.map(function (s) {
+    return '<label style="display:flex; align-items:flex-start; gap:8px; margin-bottom:8px; cursor:pointer;">' +
+           '<input type="checkbox" class="scenario-cb" value="' + esc(s.name) + '" checked style="margin-top:3px;">' +
+           '<span><strong>' + esc(s.name.replace(/^scenario_/, '').replace(/_/g, ' ')) + '</strong><br>' + esc(s.description) + '</span>' +
+           '</label>';
+  }).join('');
+}
+
+function selectAllScenarios(checked) {
+  document.querySelectorAll('.scenario-cb').forEach(function (cb) { cb.checked = checked; });
+}
+
+function selectedScenarioNames() {
+  return Array.from(document.querySelectorAll('.scenario-cb:checked')).map(function (cb) { return cb.value; });
+}
+
+async function loadRunHistory() {
+  const resp = await fetch('/api/v1/testing/golden-set/runs');
+  const runs = await resp.json();
+  const tbody = document.getElementById('runs-tbody');
+  if (!runs.length) {
+    tbody.innerHTML = '<tr><td colspan="4"><div class="empty-state">No runs yet — trigger one above.</div></td></tr>';
+    return;
+  }
+  tbody.innerHTML = runs.map(function (r) {
+    const allPass = r.pass_count === r.total_count;
+    const resultBadge = badge(r.pass_count + '/' + r.total_count, allPass ? 'resolved' : 'blocked');
+    const when = new Date(r.run_at).toLocaleString();
+    return '<tr><td>' + esc(r.label) + '</td><td>' + esc(when) + '</td><td>' + resultBadge +
+           '</td><td><a href="#" onclick="showRunDetail(\'' + r.run_id + '\'); return false;">View detail</a></td></tr>';
+  }).join('');
+}
+
+async function showRunDetail(runId) {
+  const resp = await fetch('/api/v1/testing/golden-set/runs/' + runId);
+  const detail = await resp.json();
+  document.getElementById('run-detail-label').textContent = detail.label;
+  document.getElementById('run-detail-tbody').innerHTML = detail.results.map(function (r) {
+    return '<tr><td>' + esc(r.name) + '</td><td>' + badge(r.passed ? 'PASS' : 'FAIL', r.passed ? 'resolved' : 'blocked') +
+           '</td><td class="rationale-text">' + esc(r.detail) + '</td></tr>';
+  }).join('');
+  document.getElementById('run-detail-panel').style.display = 'block';
+  document.getElementById('run-detail-panel').scrollIntoView({behavior: 'smooth'});
+}
+
+document.getElementById('golden-set-run-form').addEventListener('submit', async function (ev) {
+  ev.preventDefault();
+  const label = document.getElementById('run-label').value.trim();
+  if (!label) return;
+  const scenarioNames = selectedScenarioNames();
+  if (!scenarioNames.length) { alert('Select at least one scenario.'); return; }
+
+  document.getElementById('run-in-progress').style.display = 'block';
+  try {
+    const resp = await fetch('/api/v1/testing/golden-set/run', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({label: label, scenario_names: scenarioNames}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) { alert('Run failed: ' + (data.detail || 'unknown error')); return; }
+    document.getElementById('run-label').value = '';
+    await loadRunHistory();
+    showRunDetail(data.run_id);
+  } finally {
+    document.getElementById('run-in-progress').style.display = 'none';
+  }
+});
+
+loadScenarioCheckboxes();
+loadRunHistory();
+
+document.getElementById('btn-run-lift').addEventListener('click', async function () {
+  const resultEl = document.getElementById('lift-result');
+  resultEl.innerHTML = '<div class="rationale-text">Running...</div>';
+  const resp = await fetch('/api/v1/testing/reranker-lift');
+  const data = await resp.json();
+  const rows = data.per_case.map(function (c) {
+    const liftBadge = c.lift === null ? '\u2014' : badge((c.lift > 0 ? '+' : '') + c.lift, c.lift > 0 ? 'resolved' : (c.lift < 0 ? 'blocked' : 'diagnosing'));
+    return '<tr><td>' + esc(c.query) + '</td><td>' + (c.pre_rerank_rank === null ? '\u2014' : c.pre_rerank_rank) + '</td>' +
+           '<td>' + (c.post_rerank_rank === null ? '\u2014' : c.post_rerank_rank) + '</td><td>' + liftBadge + '</td></tr>';
+  }).join('');
+  resultEl.innerHTML = '<p><strong>Average lift:</strong> ' + (data.avg_lift === null ? '\u2014' : data.avg_lift) + '</p>' +
+    '<table><thead><tr><th>Query</th><th>Pre-rerank rank</th><th>Post-rerank rank</th><th>Lift</th></tr></thead>' +
+    '<tbody>' + rows + '</tbody></table>';
+});
+
+document.getElementById('btn-check-freshness').addEventListener('click', async function () {
+  const resultEl = document.getElementById('freshness-result');
+  resultEl.innerHTML = '<div class="rationale-text">Checking...</div>';
+  const resp = await fetch('/api/v1/testing/index-freshness');
+  const data = await resp.json();
+  if (!data.documents.length) {
+    resultEl.innerHTML = '<div class="empty-state">No indexed documents found — run ingestion first.</div>';
+    return;
+  }
+  const rows = data.documents.map(function (d) {
+    const lagDisplay = d.lag_seconds === null ? (d.note || '\u2014') : d.lag_seconds.toFixed(2) + 's';
+    return '<tr><td class="id">' + esc(d.doc_id) + '</td><td>' + esc(lagDisplay) + '</td></tr>';
+  }).join('');
+  resultEl.innerHTML = '<p><strong>Average lag:</strong> ' +
+    (data.avg_lag_seconds === null ? '\u2014' : data.avg_lag_seconds.toFixed(2) + 's') + '</p>' +
+    '<table><thead><tr><th>Document</th><th>Lag (source file \u2192 searchable)</th></tr></thead>' +
+    '<tbody>' + rows + '</tbody></table>';
+});
+
+document.getElementById('btn-run-rag-eval').addEventListener('click', async function () {
+  const resultEl = document.getElementById('rag-eval-result');
+  resultEl.innerHTML = '<div class="rationale-text">Running...</div>';
+  const resp = await fetch('/api/v1/testing/rag-eval');
+  const data = await resp.json();
+  const rows = data.per_case.map(function (c) {
+    return '<tr><td>' + esc(c.query) + '</td><td>' + esc(c.expected_doc_ids.join(', ')) + '</td>' +
+           '<td>' + esc(c.retrieved_doc_ids.slice(0, 3).join(', ')) + (c.retrieved_doc_ids.length > 3 ? '...' : '') + '</td>' +
+           '<td>' + badge(c.precision_at_k, c.precision_at_k >= 0.9 ? 'resolved' : 'blocked') + '</td>' +
+           '<td>' + badge(c.recall_at_k, c.recall_at_k >= 0.9 ? 'resolved' : 'blocked') + '</td></tr>';
+  }).join('');
+  resultEl.innerHTML = '<p><strong>Avg precision@' + data.top_k + ':</strong> ' + data.avg_precision_at_k +
+    ' &nbsp; <strong>Avg recall@' + data.top_k + ':</strong> ' + data.avg_recall_at_k + '</p>' +
+    '<table><thead><tr><th>Query</th><th>Expected</th><th>Retrieved (top 3)</th><th>Precision</th><th>Recall</th></tr></thead>' +
+    '<tbody>' + rows + '</tbody></table>';
+});
+</script>
+{% endblock %}

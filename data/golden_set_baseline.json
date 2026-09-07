@@ -1,7 +1,7 @@
 {
-  "established_at": "2026-09-06T14:07:46.668406+00:00",
-  "pass_count": 8,
-  "total": 8,
+  "established_at": "2026-09-07T09:46:03.484006+00:00",
+  "pass_count": 10,
+  "total": 10,
   "scenario_results": {
     "temporal_policy_correctness": true,
     "duplicate_refund_idempotency": true,
@@ -10,6 +10,8 @@
     "runaway_loop_terminates": true,
     "tier1_hard_block": true,
     "circuit_breaker_fails_fast": true,
-    "webhook_cache_invalidation": true
+    "webhook_cache_invalidation": true,
+    "idempotency_key_reuse_with_different_args_raises": true,
+    "pii_redacted_before_trace_persist": true
   }
 }

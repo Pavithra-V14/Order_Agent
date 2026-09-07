@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+from datetime import datetime, timezone
 
 from app.rag.extraction import extract_pdf, ExtractedElement
 from app.rag.metadata import parse_policy_metadata, PolicyMetadata
@@ -56,6 +57,19 @@ def _save_reindex_state(state: dict) -> None:
         json.dump(state, f, indent=2)
 
 
+def _extract_hashes(entry) -> dict:
+    """Backward-compatible read: reindex_state.json entries were
+    originally a flat {node_id: content_hash} dict. Adding an
+    'indexed_at' timestamp (for index-freshness-lag metrics) required
+    nesting to {"hashes": {...}, "indexed_at": "..."} — this reads
+    EITHER format correctly, so an existing reindex_state.json file
+    written before this change doesn't break or force a needless
+    full re-ingestion of every document."""
+    if isinstance(entry, dict) and "hashes" in entry:
+        return entry["hashes"]
+    return entry or {}
+
+
 def _extract_doc_id_guess(pdf_path: str) -> str:
     return os.path.splitext(os.path.basename(pdf_path))[0]
 
@@ -89,7 +103,7 @@ def ingest_policy_pdf(pdf_path: str, image_out_dir: str = "data/policy_images",
     nodes: list[RagNode] = build_nodes(elements, policy_meta)
 
     reindex_state = _load_reindex_state()
-    prev_hashes: dict = reindex_state.get(policy_meta.doc_id, {})
+    prev_hashes: dict = _extract_hashes(reindex_state.get(policy_meta.doc_id, {}))
     new_hashes: dict = {}
     nodes_to_embed: list[RagNode] = []
     skipped = 0
@@ -111,7 +125,11 @@ def ingest_policy_pdf(pdf_path: str, image_out_dir: str = "data/policy_images",
         vectors = embedder.embed([n.text for n in nodes_to_embed])
         upsert_nodes(client, collection, nodes_to_embed, vectors)
 
-    reindex_state[policy_meta.doc_id] = new_hashes
+    reindex_state[policy_meta.doc_id] = {
+        "hashes": new_hashes,
+        "indexed_at": datetime.now(timezone.utc).isoformat(),
+        "source_mtime": datetime.fromtimestamp(os.path.getmtime(pdf_path), tz=timezone.utc).isoformat(),
+    }
     _save_reindex_state(reindex_state)
 
     summary = {

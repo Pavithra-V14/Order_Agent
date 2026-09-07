@@ -2,12 +2,9 @@ from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.db import get_db, ExceptionCase, CaseState, AuditLogEntry
+from app.core.db import get_db, ExceptionCase, CaseState
 from app.guardrails.schema import ResolutionDecision
-from app.agents.execution_agent import execute_resolution, ExecutionStatus
-from app.agents.learning_loop import record_resolution_outcome
-from app.agents.comms_workflow import send_case_notification
-from app.tools.oms import get_order
+from app.agents.resolution_completion import complete_resolution
 
 router = APIRouter(prefix="/escalations", tags=["escalations"])
 
@@ -78,39 +75,7 @@ def decide_escalation(case_id: str, payload: EscalationDecisionRequest, db: Sess
     else:
         final = proposed
 
-    record_resolution_outcome(
-        db, case_id=case_id, cluster_key=f"{case.exception_type}_{case.channel}",
-        case_feature_summary=f"{case.exception_type} case, channel={case.channel}, "
-                              f"fraud_flag={case.fraud_flag}",
-        agent_proposed_resolution=proposed.model_dump(mode="json"),
-        human_final_resolution=final.model_dump(mode="json"),
+    return complete_resolution(
+        db, case=case, proposed_decision=proposed, final_decision=final,
+        decided_by=payload.decided_by, action_label="human_decision",
     )
-
-    order = get_order(db, case.order_id)
-    exec_result = execute_resolution(
-        db, case_id=case_id, decision=final, order_id=case.order_id,
-        payment_intent_id=order.get("payment_intent_id") if order else None,
-    )
-
-    case.resolution_decision = final.model_dump(mode="json")
-    case.execution_result = {"status": exec_result.status.value, "result": exec_result.result}
-
-    if exec_result.status == ExecutionStatus.PENDING_RETRY:
-        db.add(AuditLogEntry(case_id=case_id, actor=payload.decided_by, action="human_decision",
-                              detail={"action": payload.action, "outcome": "execution_pending_retry"}))
-        db.commit()
-        return {"case_id": case_id, "outcome": "execution_pending_retry", "execution": exec_result.result}
-
-    case.state = CaseState.RESOLVED
-    db.add(AuditLogEntry(case_id=case_id, actor=payload.decided_by, action="human_decision",
-                          detail={"action": payload.action, "final_resolution": final.model_dump(mode="json")}))
-    db.commit()
-
-    event_map = {"refund": "resolved_refund", "partial_credit": "resolved_partial_credit",
-                 "reship": "resolved_reship", "deny": "resolved_deny"}
-    send_case_notification(case.customer_id, event_map[final.action.value],
-                            amount=final.amount_usd,
-                            tracking_number=exec_result.result.get("tracking_number", ""))
-
-    return {"case_id": case_id, "outcome": "resolved", "final_action": final.action.value,
-            "execution": exec_result.result}

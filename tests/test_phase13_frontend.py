@@ -51,19 +51,38 @@ def client_and_db():
         pass  # Windows may still hold a brief lock from engine cleanup; harmless to leave a stray temp file
 
 def test_all_eight_pages_render(client_and_db):
-    """Every page from architecture doc 8.3 returns 200 and real HTML."""
+    """Every page from architecture doc 8.3 returns 200, real HTML, AND
+    the correct data-page attribute matching app.js's dispatch table key
+    — checking status_code alone previously let a real bug through
+    silently: page_case_detail() and page_trace() both sent
+    page_id="" instead of "case_detail"/"trace", so the JS dispatcher's
+    `dispatch[page]` lookup always came back undefined and neither
+    page's init function ever ran — both stuck on the static "Loading..."
+    placeholder forever, with this exact test passing the whole time
+    because it never checked for anything beyond a 200 status."""
     client, _ = client_and_db
 
-    static_pages = ["/", "/escalations", "/policies", "/metrics", "/threshold-config", "/audit-log"]
-    for path in static_pages:
+    static_pages = {
+        "/": "dashboard", "/escalations": "escalations", "/policies": "policies",
+        "/metrics": "metrics", "/threshold-config": "threshold", "/audit-log": "audit",
+        "/testing": "testing", "/admin": "admin",
+    }
+    for path, expected_page_id in static_pages.items():
         resp = client.get(path)
         assert resp.status_code == 200, f"{path} failed to render"
         assert "<html" in resp.text.lower()
+        assert f'data-page="{expected_page_id}"' in resp.text, (
+            f"{path} must render data-page=\"{expected_page_id}\" for app.js's dispatch table to "
+            f"actually call the right init function — a page that renders with the WRONG or empty "
+            f"page_id looks fine (200, valid HTML) but silently never runs its own JavaScript"
+        )
 
     resp = client.get("/cases/some-id")
     assert resp.status_code == 200
+    assert 'data-page="case_detail"' in resp.text
     resp = client.get("/traces/some-id")
     assert resp.status_code == 200
+    assert 'data-page="trace"' in resp.text
 
     css = client.get("/static/style.css")
     js = client.get("/static/app.js")

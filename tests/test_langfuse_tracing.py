@@ -89,6 +89,57 @@ def test_langfuse_client_constructed_with_correct_credentials(isolated_db, monke
     assert captured["secret_key"] == "sk-fake-test"
     assert captured["host"] == "https://cloud.langfuse.com"
 
+def test_langfuse_span_is_flushed_after_creation(isolated_db, monkeypatch):
+    """THE regression test for the actual reported production bug:
+    "nothing is logged in Langfuse" despite spans appearing to be
+    created without error. Langfuse's v4 SDK is OpenTelemetry-based and
+    batches spans internally, only actually sending them to the server
+    on flush() or process shutdown — an earlier version of
+    _push_to_langfuse called span.end() but never client.flush(),
+    meaning a span created inside a normal request or short-lived script
+    could sit in an internal buffer and simply never reach Langfuse's
+    backend, with no error raised anywhere to indicate this."""
+    os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-fake-test"
+    os.environ["LANGFUSE_SECRET_KEY"] = "sk-fake-test"
+    os.environ["TRACING_ENABLED"] = "true"
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    calls = {"end": 0, "flush": 0}
+
+    class FakeSpan:
+        def end(self):
+            calls["end"] += 1
+
+    class FakeLangfuse:
+        def __init__(self, public_key, secret_key, host):
+            pass
+
+        def create_trace_id(self, seed):
+            return seed
+
+        def start_observation(self, **kwargs):
+            return FakeSpan()
+
+        def flush(self):
+            calls["flush"] += 1
+
+    import app.core.tracing as tracing_module
+    monkeypatch.setattr("langfuse.Langfuse", FakeLangfuse)
+    tracing_module.reset_langfuse_client()
+
+    tracing_module._push_to_langfuse(
+        trace_id="trace-1", name="test_span", input_data={"a": 1}, output_data={"b": 2}, metadata={"c": 3},
+    )
+
+    assert calls["end"] == 1, "span.end() must be called"
+    assert calls["flush"] == 1, (
+        "client.flush() must be called after every span — without this, spans can sit in an "
+        "internal OpenTelemetry buffer and never actually reach Langfuse's backend, which is "
+        "exactly the reported production symptom of 'nothing is logged in Langfuse'"
+    )
+
+
 def test_record_span_never_raises_even_when_langfuse_push_fails(isolated_db):
     """THE key property: with tracing enabled and fake credentials, a
     real attempt to reach cloud.langfuse.com from this sandbox genuinely

@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    Column, String, Float, DateTime, Enum, JSON, ForeignKey, create_engine, Text
+    Column, String, Float, DateTime, Enum, JSON, ForeignKey, create_engine, Text, Integer
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
@@ -262,6 +262,24 @@ class ThresholdOverrideRecord(Base):
     accepted_from_proposal_id = Column(String, nullable=False)
     accepted_by = Column(String, nullable=False)
     accepted_at = Column(DateTime(timezone=True), default=_now)
+
+
+class GoldenSetRunRecord(Base):
+    """One row per labeled golden-set run triggered from the UI's
+    Testing page. Distinct from the golden baseline file
+    (data/golden_set_baseline.json, used by drift_watch.py) — this table
+    is a HISTORY of every run a person has explicitly triggered and
+    named, so multiple runs (e.g. before/after a code change) can be
+    compared side by side rather than each overwriting the last."""
+    __tablename__ = "golden_set_run_records"
+
+    id = Column(String, primary_key=True)
+    label = Column(String, nullable=False)
+    run_at = Column(DateTime(timezone=True), default=_now)
+    pass_count = Column(Integer, nullable=False)
+    total_count = Column(Integer, nullable=False)
+    results = Column(JSON, nullable=False)  # list of {scenario_name, passed, detail}
+    triggered_by = Column(String, nullable=False, default="ui")
 
 
 # --- Engine / session ---

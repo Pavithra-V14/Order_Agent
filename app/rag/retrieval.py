@@ -116,12 +116,20 @@ def hybrid_search(
     product_category: str | None = None,
     top_k: int = 5,
     use_mmr: bool = False,
+    pre_rerank_capture: callable = None,
 ) -> list[RetrievedChunk]:
     """Full retrieval pipeline: metadata pre-filter -> dense search (Qdrant,
     filter applied server-side) to get the filtered candidate pool -> BM25
     sparse re-ranking over that SAME filtered pool (so temporal/channel/
     category correctness holds on the sparse side too, not just dense) ->
     RRF fusion of the two rankings -> optional MMR -> lightweight rerank -> top_k.
+
+    pre_rerank_capture: optional callback invoked with the candidate list
+    exactly as it stood BEFORE the final reranking step — added
+    specifically to compute reranker lift (app/rag/eval.py) without
+    changing this function's return type or behavior for any other
+    caller. None of the existing call sites pass this, so nothing about
+    normal retrieval changes; it's purely an observation hook.
     """
     settings = get_settings()
     client = get_qdrant_client()
@@ -173,5 +181,13 @@ def hybrid_search(
     if use_mmr:
         candidates = _mmr_select(candidates, embedder, top_k=top_k * 2)
 
+    if pre_rerank_capture is not None:
+        pre_rerank_capture(list(candidates))
+
     reranker = LightweightReranker()
-    return reranker.rerank(query, candidates, top_k=top_k)
+    results = reranker.rerank(query, candidates, top_k=top_k)
+
+    from app.core.console_log import log_rag_retrieval
+    log_rag_retrieval(query, len(results), doc_type=doc_type)
+
+    return results

@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.agents.llm_client import BaseLLMClient
 from app.memory.episodic import summarize_customer_risk_profile
+from app.core.tracing import record_tool_call
 from app.tools import wms
 
 
@@ -32,7 +33,7 @@ def run_fraud_risk_agent(db: Session, llm: BaseLLMClient, customer_id: str,
     }
 
 
-def run_inventory_agent(db: Session, line_items: list) -> dict:
+def run_inventory_agent(db: Session, line_items: list, case_id: str = None) -> dict:
     """Fixed sequence: for each line item, query sellable stock across all
     warehouses, flag any item with insufficient sellable quantity. Always
     uses sellable_qty, never on_hand_qty alone (edge case 3.2)."""
@@ -41,7 +42,7 @@ def run_inventory_agent(db: Session, line_items: list) -> dict:
     for item in line_items:
         sku = item["sku"]
         requested_qty = item.get("qty", 1)
-        stock_by_warehouse = wms.get_stock(db, sku)
+        stock_by_warehouse = record_tool_call(db, case_id or sku, "wms.get_stock", False, wms.get_stock, db, sku)
         total_sellable = sum(s["sellable_qty"] for s in stock_by_warehouse)
         shortfall = total_sellable < requested_qty
         any_shortfall = any_shortfall or shortfall

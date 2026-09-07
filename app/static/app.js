@@ -157,7 +157,11 @@ async function initPolicies() {
     let rows = data.files_on_disk.map(function (f) {
       const stem = f.replace(/\.pdf$/i, '');
       const indexed = data.indexed_doc_ids.indexOf(stem) !== -1;
-      return '<tr><td class="id">' + esc(f) + '</td><td>' + (indexed ? badge('indexed', 'resolved') : badge('pending', 'escalated')) + '</td></tr>';
+      const info = (data.file_status || {})[f] || {};
+      const statusCell = indexed
+        ? badge('indexed', 'resolved')
+        : badge('not indexed', 'blocked') + '<div class="rationale-text">' + esc(info.detail || '') + '</div>';
+      return '<tr><td class="id">' + esc(f) + '</td><td>' + statusCell + '</td></tr>';
     }).join('');
     root.innerHTML = '<table><thead><tr><th>File</th><th>Indexed</th></tr></thead><tbody>' + rows + '</tbody></table>';
   }
@@ -173,7 +177,7 @@ async function initPolicies() {
       const res = await fetch('/api/v1/policies/upload', { method: 'POST', body: formData });
       const body = await res.json();
       if (!res.ok) throw new Error(body.detail || 'Upload failed');
-      toast('Uploaded, ingestion queued (job ' + body.job_id.slice(0, 8) + ')');
+      toast('Indexed: ' + body.filename + ' (' + (body.summary && body.summary.doc_id ? body.summary.doc_id : 'ready') + ')');
       fileInput.value = '';
       await render();
     } catch (e) {
@@ -195,11 +199,33 @@ async function initMetrics() {
         const display = v === null ? '\u2014' : (typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(3)) : esc(v));
         return '<div class="metric-card"><div class="value">' + display + '</div><div class="label">' + esc(k.replace(/_/g, ' ')) + '</div></div>';
       }).join('');
-    const rest = entries.filter(function (kv) { return typeof kv[1] === 'object' && kv[1] !== null; });
+
+    let perToolHtml = '';
+    const rest = entries.filter(function (kv) {
+      if (kv[0] === 'per_tool_metrics') { perToolHtml = renderPerToolTable(kv[1]); return false; }
+      return typeof kv[1] === 'object' && kv[1] !== null;
+    });
     const restHtml = rest.map(function (kv) {
       return '<div class="panel"><h2>' + esc(kv[0].replace(/_/g, ' ')) + '</h2><pre>' + esc(JSON.stringify(kv[1], null, 2)) + '</pre></div>';
     }).join('');
-    return '<div class="metric-grid">' + cards + '</div>' + restHtml;
+    return '<div class="metric-grid">' + cards + '</div>' + perToolHtml + restHtml;
+  }
+
+  function renderPerToolTable(perTool) {
+    const names = Object.keys(perTool);
+    if (!names.length) return '';
+    const rows = names.map(function (name) {
+      const m = perTool[name];
+      const failurePct = (m.failure_rate * 100).toFixed(1) + '%';
+      const failureCls = m.failure_rate > 0 ? 'blocked' : 'resolved';
+      const latency = m.avg_latency_ms === null ? '\u2014' : m.avg_latency_ms.toFixed(2) + ' ms';
+      const rw = m.is_write ? badge('write', 'escalated') : badge('read', 'diagnosing');
+      return '<tr><td class="id">' + esc(name) + '</td><td>' + m.call_count + '</td><td>' +
+             badge(failurePct, failureCls) + '</td><td>' + esc(latency) + '</td><td>' + rw + '</td></tr>';
+    }).join('');
+    return '<div class="panel"><h2>Per-Tool Breakdown</h2><table><thead><tr>' +
+           '<th>Tool</th><th>Calls</th><th>Failure Rate</th><th>Avg Latency</th><th>Read/Write</th>' +
+           '</tr></thead><tbody>' + rows + '</tbody></table></div>';
   }
 
   async function loadScope(scope) {

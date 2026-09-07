@@ -19,6 +19,7 @@ from enum import Enum
 from sqlalchemy.orm import Session
 
 from app.core.circuit_breaker import get_circuit_breaker, CircuitOpenError
+from app.core.tracing import record_tool_call
 from app.guardrails.schema import ResolutionDecision, ResolutionAction
 from app.tools import payment as payment_tool, wms as wms_tool, carrier as carrier_tool
 
@@ -72,8 +73,9 @@ def execute_resolution(
         for attempt in range(1, max_retries + 1):
             attempts = attempt
             try:
-                result = breaker.call(lambda: gateway.issue_refund(
-                    db, payment_intent_id, decision.amount_usd, idempotency_key
+                result = breaker.call(lambda: record_tool_call(
+                    db, case_id, "payment.issue_refund", True, gateway.issue_refund,
+                    db, payment_intent_id, decision.amount_usd, idempotency_key,
                 ))
                 return ExecutionResult(status=ExecutionStatus.EXECUTED, result=result,
                                         idempotency_key=idempotency_key, attempts_made=attempts)
@@ -97,7 +99,10 @@ def execute_resolution(
         breaker = get_circuit_breaker("carrier", failure_threshold=3, reset_timeout_seconds=30.0)
         gateway = carrier_tool.get_carrier_gateway()
         try:
-            result = breaker.call(lambda: gateway.generate_return_label(db, order_id, idempotency_key))
+            result = breaker.call(lambda: record_tool_call(
+                db, case_id, "carrier.generate_return_label", True,
+                gateway.generate_return_label, db, order_id, idempotency_key,
+            ))
             return ExecutionResult(status=ExecutionStatus.EXECUTED, result=result,
                                     idempotency_key=idempotency_key, attempts_made=1)
         except CircuitOpenError as e:

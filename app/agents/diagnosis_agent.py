@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from sqlalchemy.orm import Session
 
 from app.agents.llm_client import BaseLLMClient, DiagnosisStepPlan
+from app.core.tracing import record_tool_call
 from app.tools import oms, wms, payment, carrier as carrier_tool
 
 
@@ -33,28 +34,34 @@ class DiagnosisResult:
     terminated_reason: str = ""  # "concluded" | "max_steps_reached" | "timeout_reached"
 
 
-def _fetch_order(db: Session, order_id: str) -> dict:
-    return oms.get_order(db, order_id)
+def _fetch_order(db: Session, order_id: str, case_id: str = None) -> dict:
+    return record_tool_call(db, case_id or order_id, "oms.get_order", False, oms.get_order, db, order_id)
 
 
-def _fetch_payment(payment_intent_id: str) -> dict:
+def _fetch_payment(payment_intent_id: str, db: Session = None, case_id: str = None) -> dict:
     gateway = payment.get_payment_gateway()
-    return gateway.get_transaction_status(payment_intent_id)
+    if db is None:
+        return gateway.get_transaction_status(payment_intent_id)  # no db session available, skip tracing
+    return record_tool_call(db, case_id or payment_intent_id, "payment.get_transaction_status", False,
+                             gateway.get_transaction_status, payment_intent_id)
 
 
-def _fetch_inventory(db: Session, line_items: list) -> list:
+def _fetch_inventory(db: Session, line_items: list, case_id: str = None) -> list:
     results = []
     for item in line_items:
-        stock = wms.get_stock(db, item["sku"])
+        stock = record_tool_call(db, case_id or item["sku"], "wms.get_stock", False, wms.get_stock, db, item["sku"])
         total_sellable = sum(s["sellable_qty"] for s in stock)
         total_on_hand = sum(s["on_hand_qty"] for s in stock)
         results.append({"sku": item["sku"], "sellable_qty": total_sellable, "on_hand_qty": total_on_hand})
     return results
 
 
-def _fetch_carrier(tracking_number: str) -> dict:
+def _fetch_carrier(tracking_number: str, db: Session = None, case_id: str = None) -> dict:
     gateway = carrier_tool.get_carrier_gateway()
-    return gateway.get_tracking_status(tracking_number)
+    if db is None:
+        return gateway.get_tracking_status(tracking_number)  # no db session available, skip tracing
+    return record_tool_call(db, case_id or tracking_number, "carrier.get_tracking_status", False,
+                             gateway.get_tracking_status, tracking_number)
 
 
 def run_diagnosis(
@@ -65,6 +72,7 @@ def run_diagnosis(
     tracking_number: str = None,
     max_steps: int = 8,
     wall_clock_timeout_seconds: float = 30.0,
+    case_id: str = None,
 ) -> DiagnosisResult:
     """Runs the iterative diagnosis loop. case_context passed to the LLM
     planner is intentionally thin (just order_id) - the planner discovers
@@ -94,24 +102,24 @@ def run_diagnosis(
             )
 
         if plan.action == "check_order":
-            order = _fetch_order(db, order_id)
+            order = _fetch_order(db, order_id, case_id=case_id)
             findings["order"] = order if order else {"error": "order not found"}
             steps_taken.append({"step": step_num, "action": "check_order", "reasoning": plan.reasoning})
             continue
 
         if plan.action == "check_payment" and payment_intent_id:
-            findings["payment"] = _fetch_payment(payment_intent_id)
+            findings["payment"] = _fetch_payment(payment_intent_id, db=db, case_id=case_id)
             steps_taken.append({"step": step_num, "action": "check_payment", "reasoning": plan.reasoning})
             continue
 
         if plan.action == "check_inventory":
             line_items = findings.get("order", {}).get("line_items", [])
-            findings["inventory"] = _fetch_inventory(db, line_items)
+            findings["inventory"] = _fetch_inventory(db, line_items, case_id=case_id)
             steps_taken.append({"step": step_num, "action": "check_inventory", "reasoning": plan.reasoning})
             continue
 
         if plan.action == "check_carrier" and tracking_number:
-            findings["carrier"] = _fetch_carrier(tracking_number)
+            findings["carrier"] = _fetch_carrier(tracking_number, db=db, case_id=case_id)
             steps_taken.append({"step": step_num, "action": "check_carrier", "reasoning": plan.reasoning})
             continue
 
@@ -132,18 +140,18 @@ def run_diagnosis(
 
 
 def run_parallel_initial_fanout(db: Session, order: dict, payment_intent_id: str,
-                                 tracking_number: str) -> dict:
+                                 tracking_number: str, case_id: str = None) -> dict:
     """Once the order is known, independent reads (payment, inventory,
     carrier) run concurrently rather than sequentially. Returns a findings
     dict usable as a fast-path seed for the loop above."""
     tasks = {}
     with ThreadPoolExecutor(max_workers=3) as executor:
         if payment_intent_id:
-            tasks["payment"] = executor.submit(_fetch_payment, payment_intent_id)
+            tasks["payment"] = executor.submit(_fetch_payment, payment_intent_id, db, case_id)
         if order.get("line_items"):
-            tasks["inventory"] = executor.submit(_fetch_inventory, db, order["line_items"])
+            tasks["inventory"] = executor.submit(_fetch_inventory, db, order["line_items"], case_id)
         if tracking_number:
-            tasks["carrier"] = executor.submit(_fetch_carrier, tracking_number)
+            tasks["carrier"] = executor.submit(_fetch_carrier, tracking_number, db, case_id)
 
         results = {"order": order}
         for key, future in tasks.items():

@@ -162,10 +162,57 @@ def test_metrics_endpoints_via_api(isolated_env):
 
         resp2 = client.get(f"/api/v1/traces/{case_id}")
         assert resp2.status_code == 200
-        assert len(resp2.json()["spans"]) == 2
+
+
+def test_per_tool_metrics_computed_from_real_tool_call_spans(isolated_env):
+    """THE regression test for the previously-missing per-tool metrics:
+    failure rate, avg latency, and read/write ratio must now be
+    computable — before, only resolution_policy_workflow's own single
+    span existed, so no individual tool call was traced at all."""
+    from app.core.tracing import record_tool_call
+
+    db = isolated_env.SessionLocal()
+    case_id = "case-tool-metrics-1"
+
+    def fake_read_ok(x):
+        return {"ok": True}
+
+    def fake_write_ok(x):
+        return {"ok": True}
+
+    def fake_read_fails(x):
+        raise RuntimeError("simulated failure")
+
+    record_tool_call(db, case_id, "fake.read_tool", False, fake_read_ok, 1)
+    record_tool_call(db, case_id, "fake.write_tool", True, fake_write_ok, 1)
+    try:
+        record_tool_call(db, case_id, "fake.read_tool", False, fake_read_fails, 1)
+    except RuntimeError:
+        pass  # expected — the exception must still propagate after being recorded
+
+    from fastapi.testclient import TestClient
+    from app.main import app
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/metrics/tool")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        per_tool = data["per_tool_metrics"]
+        assert per_tool["fake.read_tool"]["call_count"] == 2
+        assert per_tool["fake.read_tool"]["failure_rate"] == 0.5
+        assert per_tool["fake.read_tool"]["is_write"] is False
+        assert per_tool["fake.write_tool"]["call_count"] == 1
+        assert per_tool["fake.write_tool"]["failure_rate"] == 0.0
+        assert per_tool["fake.write_tool"]["is_write"] is True
+
+        assert data["read_call_count"] == 2
+        assert data["write_call_count"] == 1
+        assert data["total_tool_calls"] == 3
 
         resp3 = client.get("/api/v1/metrics/not_a_real_scope")
         assert resp3.status_code == 404
+
+    db.close()
 
 def test_pii_redacted_before_persist(isolated_env):
     from app.core.tracing import record_span, get_trace

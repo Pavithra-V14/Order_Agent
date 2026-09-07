@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Admin{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Admin — Data Management</h1>
+  <p>Development/testing reset tools. These delete real data with no undo — used mainly to reset the system to a clean state between test runs.</p>
+</div>
+
+<div class="panel" style="max-width:640px; margin-bottom:16px;">
+  <h2>Delete Audit Log</h2>
+  <p class="rationale-text">Deletes every audit log entry only. Cases, orders, and everything else stay untouched.</p>
+  <button id="btn-delete-audit" class="danger">Delete Audit Log</button>
+  <div id="result-audit" class="rationale-text" style="margin-top:8px;"></div>
+</div>
+
+<div class="panel" style="max-width:640px; margin-bottom:16px;">
+  <h2>Delete RAG Index</h2>
+  <p class="rationale-text">Deletes the Qdrant collection (policy embeddings) and clears the local reindex-state tracker. Run scripts/run_ingestion.py afterward to rebuild it from scratch.</p>
+  <button id="btn-delete-rag" class="danger">Delete RAG Index</button>
+  <div id="result-rag" class="rationale-text" style="margin-top:8px;"></div>
+</div>
+
+<div class="panel" style="max-width:640px; margin-bottom:16px; border-color:#c0392b;">
+  <h2>Delete ALL Data (Postgres/SQLite)</h2>
+  <p class="rationale-text"><strong>Every case, order, stock record, audit entry, trace span, learning-loop pattern, and threshold override — gone.</strong> Does not touch the RAG index or the long-term memory graph (Neo4j/Kuzu) — those have their own separate reset above / are external systems.</p>
+  <button id="btn-delete-all" class="danger">Delete ALL Data</button>
+  <div id="result-all" class="rationale-text" style="margin-top:8px;"></div>
+</div>
+
+<script>
+function confirmAndDelete(url, resultElId, label) {
+  if (!confirm('Are you sure? This deletes ' + label + ' with no undo.')) return;
+  fetch(url + '?confirm=true', { method: 'DELETE' })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      document.getElementById(resultElId).textContent = JSON.stringify(data, null, 2);
+    })
+    .catch(function (err) {
+      document.getElementById(resultElId).textContent = 'Error: ' + err;
+    });
+}
+
+document.getElementById('btn-delete-audit').addEventListener('click', function () {
+  confirmAndDelete('/api/v1/admin/audit-log', 'result-audit', 'the entire audit log');
+});
+document.getElementById('btn-delete-rag').addEventListener('click', function () {
+  confirmAndDelete('/api/v1/admin/rag-index', 'result-rag', 'the RAG index');
+});
+document.getElementById('btn-delete-all').addEventListener('click', function () {
+  confirmAndDelete('/api/v1/admin/all-data', 'result-all', 'ALL application data');
+});
+</script>
+{% endblock %}

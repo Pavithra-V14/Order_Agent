@@ -82,6 +82,54 @@ def record_span(
     return span
 
 
+def record_tool_call(db: Session, trace_id: str, tool_name: str, is_write: bool, fn, *args, **kwargs):
+    """Wraps a single tool call (payment/wms/carrier/oms) with tracing —
+    the previously-missing per-tool-call instrumentation that
+    app/core/metrics.py's docstring documented as needed for per-tool
+    failure rate/latency, read/write ratio, and argument validity rate.
+    Before this, only resolution_policy_workflow.py ever called
+    record_span() directly; no individual tool call was traced at all.
+
+    Also prints a live line to the terminal via app.core.console_log —
+    a real, separately-requested piece of operational visibility: the
+    DB-persisted trace span is queryable after the fact, but gives no
+    indication while WATCHING a running process of what's happening in
+    real time.
+
+    Records success or failure, latency, and read/write classification
+    on every call — the call itself is never suppressed or altered:
+    exceptions still propagate normally to the caller after being
+    recorded, so this never changes the actual behavior of a failing
+    tool call, only what gets observed about it.
+    """
+    from app.core.console_log import log_tool_call
+    start = time.monotonic()
+    try:
+        result = fn(*args, **kwargs)
+        latency_ms = (time.monotonic() - start) * 1000
+        record_span(
+            db, trace_id=trace_id, agent_or_tool_name=f"tool:{tool_name}",
+            input_data={"args_repr": repr(args)[:500], "kwargs_repr": repr(kwargs)[:500]},
+            output_data={"success": True},
+            metadata={"latency_ms": round(latency_ms, 2), "is_write": is_write, "status": "success"},
+        )
+        log_tool_call(tool_name, is_write, "success", latency_ms, case_id=trace_id)
+        return result
+    except Exception as e:
+        latency_ms = (time.monotonic() - start) * 1000
+        try:
+            record_span(
+                db, trace_id=trace_id, agent_or_tool_name=f"tool:{tool_name}",
+                input_data={"args_repr": repr(args)[:500], "kwargs_repr": repr(kwargs)[:500]},
+                output_data={"error": str(e)},
+                metadata={"latency_ms": round(latency_ms, 2), "is_write": is_write, "status": "failed"},
+            )
+        except Exception:
+            pass  # tracing must never mask the original tool failure below
+        log_tool_call(tool_name, is_write, "failed", latency_ms, case_id=trace_id)
+        raise
+
+
 def _push_to_langfuse(trace_id: str, name: str, input_data: dict, output_data: dict,
                        metadata: dict, parent_span_id: str = None) -> None:
     from app.core.config import get_settings
@@ -100,6 +148,18 @@ def _push_to_langfuse(trace_id: str, name: str, input_data: dict, output_data: d
             input=input_data, output=output_data, metadata=metadata,
         )
         span.end()
+        # Found necessary directly: Langfuse's v4 SDK is OpenTelemetry-
+        # based and batches spans internally, only actually sending them
+        # to the server on flush() or process shutdown. Without this
+        # call, a span created inside a normal request-handling flow (or
+        # a short-lived script) can sit in an internal buffer and simply
+        # never reach Langfuse's backend — which is exactly why nothing
+        # showed up in the Langfuse dashboard despite this code
+        # appearing to run without error. Flushing per-span trades a
+        # little batching efficiency for guaranteed delivery, an
+        # acceptable tradeoff given this project's actual per-case span
+        # volume is low.
+        client.flush()
     except Exception as e:
         # Never let an observability-layer failure break the traced
         # operation itself — logged, not raised.
