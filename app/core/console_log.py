@@ -31,16 +31,26 @@ def log_agent_step(agent_name: str, message: str, case_id: str = None) -> None:
     _logger.info(f"AGENT  {agent_name:<20} {prefix}{message}")
 
 
-def log_tool_call(tool_name: str, is_write: bool, status: str, latency_ms: float = None, case_id: str = None) -> None:
+def log_tool_call(tool_name: str, is_write: bool, status: str, latency_ms: float = None,
+                   case_id: str = None, error: str = None) -> None:
     """A tool call (payment/wms/carrier/oms) completing - mirrors what
     record_tool_call() persists to the database, printed to the
     terminal at the same moment so it's visible live, not just
-    queryable afterward."""
+    queryable afterward.
+
+    Includes the actual error text on failure — found necessary
+    directly: a real Shippo API failure printed only "status=failed
+    (2516.0ms)" with no indication of WHY, while the actual error
+    message existed the whole time but was never passed through to this
+    function at all. Seeing "failed" without a reason is barely more
+    useful than seeing nothing.
+    """
     prefix = f"[case={case_id[:8]}] " if case_id else ""
     kind = "WRITE" if is_write else "READ "
     latency_str = f"{latency_ms:.1f}ms" if latency_ms is not None else "?"
     level = _logger.info if status == "success" else _logger.warning
-    level(f"TOOL   {kind} {tool_name:<30} {prefix}status={status} ({latency_str})")
+    error_str = f" error={error!r}" if error else ""
+    level(f"TOOL   {kind} {tool_name:<30} {prefix}status={status} ({latency_str}){error_str}")
 
 
 def log_rag_retrieval(query: str, num_results: int, doc_type: str = None) -> None:

@@ -126,7 +126,7 @@ def record_tool_call(db: Session, trace_id: str, tool_name: str, is_write: bool,
             )
         except Exception:
             pass  # tracing must never mask the original tool failure below
-        log_tool_call(tool_name, is_write, "failed", latency_ms, case_id=trace_id)
+        log_tool_call(tool_name, is_write, "failed", latency_ms, case_id=trace_id, error=str(e))
         raise
 
 

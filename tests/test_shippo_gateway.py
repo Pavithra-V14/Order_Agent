@@ -209,6 +209,39 @@ def test_shippo_generate_return_label_raises_on_failed_transaction(shippo_settin
         gateway.generate_return_label(db, order_id="ORD-SHIPPO-4", idempotency_key="shippo-key-4")
     db.close()
 
+@respx.mock
+def test_shippo_generate_return_label_includes_email_and_phone_on_addresses(shippo_settings, isolated_db):
+    """THE regression test for a real production error found by actually
+    running against Shippo's live API: 'Seller info missing email or
+    phone. Seller email and phone number required for USPS.' The
+    address payloads previously had no email/phone fields at all —
+    Shippo's mocked test responses never caught this because the mock
+    doesn't validate the REQUEST the way Shippo's real API does; only
+    running against the real backend surfaced it."""
+    from app.tools.carrier import ShippoGateway
+
+    shipment_route = respx.post(f"{SHIPPO_BASE}/shipments/").mock(return_value=httpx.Response(200, json={
+        "object_id": "shp_fake_email_check",
+        "rates": [{"object_id": "rate_fake1", "amount": "7.50", "provider": "USPS"}],
+    }))
+    respx.post(f"{SHIPPO_BASE}/transactions/").mock(return_value=httpx.Response(200, json={
+        "object_id": "trans_fake_email_check", "status": "SUCCESS",
+        "tracking_number": "TRACKEMAILCHECK", "label_url": "https://example.com/label.pdf",
+    }))
+
+    db = isolated_db.SessionLocal()
+    gateway = ShippoGateway()
+    gateway.generate_return_label(db, order_id="ORD-EMAIL-CHECK", idempotency_key="email-check-key")
+
+    import json
+    sent_body = json.loads(shipment_route.calls[0].request.content)
+    assert sent_body["address_from"].get("email"), "address_from must include an email — USPS requires it"
+    assert sent_body["address_from"].get("phone"), "address_from must include a phone — USPS requires it"
+    assert sent_body["address_to"].get("email"), "address_to must include an email"
+    assert sent_body["address_to"].get("phone"), "address_to must include a phone"
+    db.close()
+
+
 def test_get_carrier_gateway_returns_shippo_when_key_configured(shippo_settings):
     from app.tools.carrier import get_carrier_gateway, ShippoGateway
     gateway = get_carrier_gateway()

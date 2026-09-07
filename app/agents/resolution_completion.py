@@ -63,9 +63,12 @@ def complete_resolution(
 
     if exec_result.status == ExecutionStatus.PENDING_RETRY:
         db.add(AuditLogEntry(case_id=case.id, actor=decided_by, action=action_label,
-                              detail={"outcome": "execution_pending_retry"}))
+                              detail={"outcome": "execution_pending_retry", "error": exec_result.error}))
         db.commit()
-        return {"case_id": case.id, "outcome": "execution_pending_retry", "execution": exec_result.result}
+        return {
+            "case_id": case.id, "outcome": "execution_pending_retry",
+            "execution": exec_result.result, "error": exec_result.error,
+        }
 
     case.state = CaseState.RESOLVED
     db.add(AuditLogEntry(case_id=case.id, actor=decided_by, action=action_label,

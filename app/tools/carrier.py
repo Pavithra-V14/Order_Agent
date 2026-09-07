@@ -194,10 +194,12 @@ class ShippoGateway(CarrierGateway):
                 "address_from": {
                     "name": "Customer", "street1": "179 N Harbor Dr",
                     "city": "Redondo Beach", "state": "CA", "zip": "90277", "country": "US",
+                    "email": "returns@example.com", "phone": "+1 555 341 9393",
                 },
                 "address_to": {
                     "name": "Returns Processing", "street1": "417 Montgomery St",
                     "city": "San Francisco", "state": "CA", "zip": "94104", "country": "US",
+                    "email": "warehouse@example.com", "phone": "+1 555 341 9393",
                 },
                 "parcels": [{
                     "length": "10", "width": "8", "height": "4", "distance_unit": "in",

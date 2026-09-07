@@ -44,6 +44,63 @@ def reset_all():
     yield
 
 
+def test_pending_retry_outcome_includes_the_actual_error_message(isolated_db):
+    """THE regression test for a real bug found from a live run: a
+    genuine Shippo API failure printed only an empty execution result
+    with no error message anywhere — complete_resolution()'s
+    PENDING_RETRY branch dropped ExecutionResult.error entirely, only
+    ever returning the (empty) result dict. This left a person watching
+    the terminal or reading the API response with zero indication of
+    WHY something failed, only that it did."""
+    from app.core.db import SessionLocal, ExceptionCase, CaseState
+    from app.tools.oms import create_order
+    from app.guardrails.schema import ResolutionDecision, ResolutionAction, CitedPolicy
+    from app.agents.resolution_completion import complete_resolution
+    from app.core.circuit_breaker import reset_all_breakers
+
+    reset_all_breakers()
+    db = SessionLocal()
+    create_order(db, order_id="ORD-ERR-VISIBILITY", customer_id="CUST-ERR-VISIBILITY", channel="direct",
+                 status="paid", total_amount_usd=30.0,
+                 purchase_date=datetime(2025, 6, 15, tzinfo=timezone.utc),
+                 line_items=[{"sku": "SKU-ERR-VISIBILITY", "category": "apparel", "qty": 1, "price": 30.0}])
+
+    case = ExceptionCase(id="case-err-visibility", order_id="ORD-ERR-VISIBILITY", customer_id="CUST-ERR-VISIBILITY",
+                          channel="direct", exception_type="delivery", state=CaseState.DETECTED)
+    db.add(case)
+    db.commit()
+
+    # RESHIP against a carrier gateway that will fail because no real
+    # carrier is configured in this test environment in a way that
+    # succeeds — genuinely exercising the PENDING_RETRY path, not a mock.
+    decision = ResolutionDecision(
+        action=ResolutionAction.RESHIP, amount_usd=0.0, confidence=0.9,
+        reasoning="test reasoning long enough to pass validation",
+        cited_policy=CitedPolicy(doc_id="RET-POLICY-2025-A", version="1", clause_summary="x"),
+    )
+
+    import app.tools.carrier as carrier_module
+    original_gateway_fn = carrier_module.get_carrier_gateway
+
+    class AlwaysFailsGateway:
+        def generate_return_label(self, db, order_id, idempotency_key):
+            raise RuntimeError("simulated real carrier API failure: 400 Bad Request - invalid address")
+
+    carrier_module.get_carrier_gateway = lambda: AlwaysFailsGateway()
+    try:
+        result = complete_resolution(
+            db, case=case, proposed_decision=decision, final_decision=decision,
+            decided_by="system:test", action_label="test_reship",
+        )
+    finally:
+        carrier_module.get_carrier_gateway = original_gateway_fn
+
+    assert result["outcome"] == "execution_pending_retry"
+    assert result["error"], "the actual error message must be present, not silently dropped"
+    assert "invalid address" in result["error"]
+    db.close()
+
+
 def test_auto_execute_case_actually_gets_resolved(isolated_db):
     """THE core proof: a genuine auto-execute routing decision now
     actually executes and resolves the case - previously, NOTHING did

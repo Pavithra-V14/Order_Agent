@@ -27,6 +27,26 @@ class PaymentGateway(ABC):
     def issue_refund(self, db: Session, payment_intent_id: str, amount_usd: float,
                       idempotency_key: str) -> dict: ...
 
+    def seed_transaction(self, payment_intent_id: str, amount_usd: float, status: str = "succeeded") -> None:
+        """No-op on the base class, overridden with real behavior only by
+        FakePaymentGateway. A real gateway's transaction state is
+        determined by the real provider (Stripe), not something this
+        code can declare into existence — calling this on a real
+        StripeGateway is a no-op with a clear explanation rather than a
+        crash, so demo/seed scripts written against the fake gateway
+        don't break the moment a real STRIPE_API_KEY gets configured.
+        Found necessary directly: get_payment_gateway() now auto-selects
+        StripeGateway when a key is present, and every seed/demo script
+        in this project calls seed_transaction() unconditionally.
+        """
+        from app.core.console_log import log_warning
+        log_warning(
+            "payment",
+            f"seed_transaction() called on {type(self).__name__} — this is a no-op on real gateways, "
+            f"since a real payment's status is determined by the real provider, not declared by this code. "
+            f"Use scripts/create_real_stripe_test_payment.py to set up a genuinely refundable payment instead.",
+        )
+
 
 class StripeGateway(PaymentGateway):
     """Production implementation — real Stripe test mode. Not callable in
@@ -115,15 +135,30 @@ class FakePaymentGateway(PaymentGateway):
 
 
 _fake_gateway_singleton: FakePaymentGateway | None = None
+_stripe_singleton: StripeGateway | None = None
 
 
 def get_payment_gateway() -> PaymentGateway:
-    """Swap point: return StripeGateway() here once running with real
-    network access + STRIPE_API_KEY. Kept as a module-level singleton for
-    the fake so its in-memory transaction/call-count state persists across
-    calls within a process — required for the idempotency test to mean
-    anything (a fresh instance per call would trivially "pass" by having
-    no memory of the first call at all)."""
+    """Auto-selects StripeGateway when STRIPE_API_KEY is configured,
+    falling back to FakePaymentGateway otherwise — same settings-driven
+    pattern as get_llm_client()/get_embedder()/get_carrier_gateway().
+
+    Found and fixed a real gap here: StripeGateway was fully written and
+    tested for construction, but this factory function NEVER actually
+    checked for STRIPE_API_KEY at all — it unconditionally returned the
+    fake gateway regardless of what was configured. Every refund in
+    every environment running this project, including ones with a real
+    Stripe key set, was silently using the fake gateway the whole time.
+    """
+    from app.core.config import get_settings
+    settings = get_settings()
+
+    if settings.stripe_api_key:
+        global _stripe_singleton
+        if _stripe_singleton is None:
+            _stripe_singleton = StripeGateway()
+        return _stripe_singleton
+
     global _fake_gateway_singleton
     if _fake_gateway_singleton is None:
         _fake_gateway_singleton = FakePaymentGateway()
@@ -133,5 +168,6 @@ def get_payment_gateway() -> PaymentGateway:
 def reset_fake_gateway() -> None:
     """Test helper — forces a fresh FakePaymentGateway (fresh transaction
     state + call counter) between test cases."""
-    global _fake_gateway_singleton
+    global _fake_gateway_singleton, _stripe_singleton
     _fake_gateway_singleton = None
+    _stripe_singleton = None

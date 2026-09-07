@@ -225,7 +225,7 @@ For a worked end-to-end example of the orchestrator (Phase 6) running diagnosis 
 cp .env.example .env      # fill in whichever cloud services you want (see .env.example for signup links)
 uvicorn app.main:app --reload
 # if you set REDIS_URL: also run, as a separate process:
-python3 scripts/run_rq_worker.py
+uv run python scripts/run_rq_worker.py
 ```
 
 `docker-compose.yml` still exists in this repo for anyone who *does* have Docker and prefers self-hosting Postgres/Redis/Qdrant locally instead of using their cloud equivalents — but it is not required for anything in this project.

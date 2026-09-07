@@ -132,3 +132,50 @@ def test_delete_rag_index_removes_collection(tmp_path):
 
     os.environ.pop("QDRANT_LOCAL_PATH", None)
     get_settings.cache_clear()
+
+
+def test_backend_status_reports_fake_when_nothing_configured():
+    from app.main import app
+    from fastapi.testclient import TestClient
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/admin/backend-status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "FakePaymentGateway" in data["payment"]["active"]
+        assert "FakeCarrierGateway" in data["carrier"]["active"]
+        assert "FakeLLMClient" in data["llm"]["active"]
+        assert "TF-IDF" in data["embedder"]["active"]
+
+
+def test_backend_status_reports_real_when_credentials_configured(monkeypatch):
+    """THE regression test proving this diagnostic actually reflects
+    real configuration state, not a hardcoded answer."""
+    monkeypatch.setenv("STRIPE_API_KEY", "sk_test_fake_for_status_check")
+    monkeypatch.setenv("SHIPPO_API_KEY", "shippo_test_fake_for_status_check")
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    from app.main import app
+    from fastapi.testclient import TestClient
+    with TestClient(app) as client:
+        data = client.get("/api/v1/admin/backend-status").json()
+        assert "Stripe" in data["payment"]["active"]
+        assert "Shippo" in data["carrier"]["active"]
+
+    get_settings.cache_clear()
+
+
+def test_backend_status_flags_easypost_priority_when_both_carrier_keys_set(monkeypatch):
+    monkeypatch.setenv("EASYPOST_API_KEY", "EZTK_fake")
+    monkeypatch.setenv("SHIPPO_API_KEY", "shippo_test_fake")
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    from app.main import app
+    from fastapi.testclient import TestClient
+    with TestClient(app) as client:
+        data = client.get("/api/v1/admin/backend-status").json()
+        assert "EasyPost" in data["carrier"]["active"]
+        assert data["carrier"]["note"] is not None
+
+    get_settings.cache_clear()

@@ -7,6 +7,13 @@
 </div>
 
 <div class="panel" style="max-width:640px; margin-bottom:16px;">
+  <h2>Backend Status</h2>
+  <p class="rationale-text">Which real implementation is active for each swappable component, right now, based on your actual configuration.</p>
+  <button id="btn-check-backend-status">Check Backend Status</button>
+  <div id="backend-status-result" style="margin-top:12px;"></div>
+</div>
+
+<div class="panel" style="max-width:640px; margin-bottom:16px;">
   <h2>Delete Audit Log</h2>
   <p class="rationale-text">Deletes every audit log entry only. Cases, orders, and everything else stay untouched.</p>
   <button id="btn-delete-audit" class="danger">Delete Audit Log</button>
@@ -28,6 +35,28 @@
 </div>
 
 <script>
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+}); }
+
+document.getElementById('btn-check-backend-status').addEventListener('click', async function () {
+  const resultEl = document.getElementById('backend-status-result');
+  resultEl.innerHTML = '<div class="rationale-text">Checking...</div>';
+  const resp = await fetch('/api/v1/admin/backend-status');
+  const data = await resp.json();
+  const rows = Object.entries(data).map(function (kv) {
+    const name = kv[0].replace(/_/g, ' ');
+    const info = kv[1];
+    const isReal = info.active.includes('(real)');
+    const badgeCls = isReal ? 'resolved' : 'diagnosing';
+    let extra = '';
+    if (info.note) extra += '<div class="rationale-text">' + esc(info.note) + '</div>';
+    if (info.model) extra += '<div class="rationale-text">model: ' + esc(info.model) + '</div>';
+    if (info.url) extra += '<div class="rationale-text">' + esc(info.url) + '</div>';
+    return '<tr><td>' + esc(name) + '</td><td><span class="badge ' + badgeCls + '">' + esc(info.active) + '</span>' + extra + '</td></tr>';
+  }).join('');
+  resultEl.innerHTML = '<table><thead><tr><th>Component</th><th>Active</th></tr></thead><tbody>' + rows + '</tbody></table>';
+});
 function confirmAndDelete(url, resultElId, label) {
   if (!confirm('Are you sure? This deletes ' + label + ' with no undo.')) return;
   fetch(url + '?confirm=true', { method: 'DELETE' })
