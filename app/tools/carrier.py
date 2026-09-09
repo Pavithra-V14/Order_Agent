@@ -17,10 +17,42 @@ from app.tools.idempotency import with_idempotency
 
 class CarrierGateway(ABC):
     @abstractmethod
-    def get_tracking_status(self, tracking_number: str) -> dict: ...
+    def get_tracking_status(self, tracking_number: str, carrier: str = None) -> dict: ...
 
     @abstractmethod
     def generate_return_label(self, db: Session, order_id: str, idempotency_key: str) -> dict: ...
+
+    def seed_tracking(self, tracking_number: str, status: str) -> None:
+        """No-op on the base class, overridden with real behavior only by
+        FakeCarrierGateway.
+
+        CORRECTED, worth being explicit about the mistake: this
+        docstring previously claimed no real carrier API lets you
+        declare an arbitrary tracking number's status on demand. That
+        was wrong, stated too confidently without checking first —
+        Shippo genuinely DOES support this in test mode, via a
+        different mechanism than this seed_tracking() method: pass
+        carrier="shippo" (Shippo's own reserved test-mode carrier
+        token, not a real carrier) together with one of Shippo's
+        documented magic tracking numbers (SHIPPO_DELIVERED,
+        SHIPPO_RETURNED, SHIPPO_TRANSIT, SHIPPO_FAILURE,
+        SHIPPO_PRE_TRANSIT, SHIPPO_UNKNOWN) directly to
+        get_tracking_status() — the same pattern as Stripe's test card
+        numbers. This method (seed_tracking) remains a no-op on real
+        gateways because it's a different, arbitrary-value interface
+        (any string, any status) that genuinely has no real-gateway
+        equivalent; Shippo's actual mechanism is the fixed, documented
+        set of magic tokens above, used directly, not through this method.
+        """
+        from app.core.console_log import log_warning
+        log_warning(
+            "carrier",
+            f"seed_tracking() called on {type(self).__name__} — this is a no-op on real gateways. "
+            f"For Shippo specifically, use carrier='shippo' with a magic tracking number "
+            f"(SHIPPO_DELIVERED, SHIPPO_RETURNED, etc.) via get_tracking_status() instead — "
+            f"that genuinely simulates a real status in test mode. This arbitrary seed_tracking() "
+            f"interface (any string, any status) has no equivalent on real carrier gateways.",
+        )
 
 
 class EasyPostGateway(CarrierGateway):
@@ -66,12 +98,20 @@ class EasyPostGateway(CarrierGateway):
             timeout=30.0,
         )
 
-    def get_tracking_status(self, tracking_number: str) -> dict:
+    def get_tracking_status(self, tracking_number: str, carrier: str = None) -> dict:
         """EasyPost dedupes trackers by (tracking_code, carrier) — POSTing
         a tracking_code that already has a tracker attached to this
         account returns the EXISTING tracker (with its current status),
         rather than creating a duplicate. This is the correct
-        EasyPost-idiomatic way to look up status, not a workaround."""
+        EasyPost-idiomatic way to look up status, not a workaround.
+
+        carrier: accepted for interface uniformity with ShippoGateway
+        (which genuinely needs it — Shippo's own test-mode magic
+        tracking numbers like SHIPPO_DELIVERED require carrier="shippo"
+        explicitly). EasyPost doesn't need a carrier hint to look up an
+        existing tracker by code alone, so this is accepted and ignored,
+        not because it's meaningless everywhere.
+        """
         try:
             resp = self._client.post("/trackers", json={"tracker": {"tracking_code": tracking_number}})
             resp.raise_for_status()
@@ -174,6 +214,18 @@ class ShippoGateway(CarrierGateway):
         )
 
     def get_tracking_status(self, tracking_number: str, carrier: str = "usps") -> dict:
+        """carrier="shippo" (not a real carrier — Shippo's own reserved
+        test-mode token) combined with one of Shippo's documented magic
+        tracking numbers (SHIPPO_PRE_TRANSIT, SHIPPO_TRANSIT,
+        SHIPPO_DELIVERED, SHIPPO_RETURNED, SHIPPO_FAILURE,
+        SHIPPO_UNKNOWN) genuinely simulates that exact status against a
+        real test-mode API key — no real physical package required. This
+        was found and fixed directly after initially, incorrectly,
+        claiming no such capability existed (see seed_tracking()'s
+        corrected docstring for the full story) — Shippo documents this
+        explicitly as their test-tracking mechanism, the same pattern as
+        Stripe's test card numbers.
+        """
         try:
             resp = self._client.get(f"/tracks/{carrier}/{tracking_number}")
             resp.raise_for_status()
@@ -213,23 +265,54 @@ class ShippoGateway(CarrierGateway):
             rates = shipment.get("rates") or []
             if not rates:
                 raise RuntimeError(f"Shippo returned no rates for shipment {shipment.get('object_id')}")
-            lowest_rate = min(rates, key=lambda r: float(r["amount"]))
 
-            transaction_resp = self._client.post("/transactions/", json={
-                "rate": lowest_rate["object_id"], "async": False, "label_file_type": "PDF",
-            })
-            transaction_resp.raise_for_status()
-            transaction = transaction_resp.json()
+            # Try rates cheapest-first, skipping any carrier that isn't
+            # actually activated on this account, rather than failing
+            # outright the moment the single cheapest rate happens to
+            # belong to an unregistered carrier. Found directly from a
+            # real, reproducible failure: the cheapest rate was UPS,
+            # which wasn't activated in the account's Shippo dashboard,
+            # producing a real "ups_registration_error" — a carrier-
+            # activation problem, not a transient one, so blindly
+            # retrying the SAME rate would fail identically forever.
+            # This tries the next-cheapest rate from a DIFFERENT
+            # carrier instead, which is what a person manually
+            # comparing rates would naturally do.
+            sorted_rates = sorted(rates, key=lambda r: float(r["amount"]))
+            last_registration_error = None
+            for rate in sorted_rates:
+                transaction_resp = self._client.post("/transactions/", json={
+                    "rate": rate["object_id"], "async": False, "label_file_type": "PDF",
+                })
+                transaction_resp.raise_for_status()
+                transaction = transaction_resp.json()
 
-            if transaction.get("status") != "SUCCESS":
-                raise RuntimeError(f"Shippo transaction did not succeed: {transaction.get('messages')}")
+                if transaction.get("status") == "SUCCESS":
+                    return {
+                        "tracking_number": transaction["tracking_number"],
+                        "label_url": transaction["label_url"],
+                        "order_id": order_id,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    }
 
-            return {
-                "tracking_number": transaction["tracking_number"],
-                "label_url": transaction["label_url"],
-                "order_id": order_id,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
+                messages = transaction.get("messages") or []
+                is_registration_error = any(
+                    "registration_error" in (m.get("code") or "") for m in messages
+                )
+                if is_registration_error:
+                    last_registration_error = messages
+                    continue  # try the next-cheapest rate from a different carrier
+                # A non-registration failure (address validation, etc.)
+                # isn't something trying a different carrier would fix —
+                # surface it immediately rather than masking it by
+                # silently working through every remaining rate.
+                raise RuntimeError(f"Shippo transaction did not succeed: {messages}")
+
+            raise RuntimeError(
+                f"No activated carrier could fulfill this shipment — every rate failed with a "
+                f"carrier-registration error. Activate a carrier at "
+                f"https://apps.goshippo.com/settings/carriers. Last error: {last_registration_error}"
+            )
 
         result, was_replayed = with_idempotency(
             db=db, idempotency_key=idempotency_key, tool_name="carrier_generate_label",
@@ -252,7 +335,7 @@ class FakeCarrierGateway(CarrierGateway):
     def seed_tracking(self, tracking_number: str, status: str):
         self._tracking[tracking_number] = status
 
-    def get_tracking_status(self, tracking_number: str) -> dict:
+    def get_tracking_status(self, tracking_number: str, carrier: str = None) -> dict:
         status = self._tracking.get(tracking_number, "unknown")
         return {"tracking_number": tracking_number, "status": status}
 

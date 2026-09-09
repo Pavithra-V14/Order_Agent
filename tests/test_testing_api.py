@@ -243,3 +243,59 @@ def test_golden_set_subprocess_ignores_a_real_env_file_with_cloud_credentials(is
                 f.write(original_content)
         elif os.path.exists(env_path):
             os.remove(env_path)
+
+
+def test_golden_set_subprocess_forces_fake_gateways_even_when_isolation_layers_are_insufficient(isolated_db):
+    """THE regression test for a real production bug found from an
+    actual user report: the two EXISTING isolation layers (stripping
+    inherited env vars, disabling .env file reading) were still
+    insufficient in a real environment — a golden-set run selected a
+    real StripeGateway instead of the fake one, causing
+    scenario_circuit_breaker_fails_fast to crash outright
+    ('StripeGateway' object has no attribute 'inject_transient_failures')
+    and multi_cause_diagnosis to silently produce a different, wrong
+    result (missing the payment_issue root cause, since the real
+    gateway's transaction lookup behaved differently than the fake
+    gateway the scenario was actually designed around).
+
+    This proves a THIRD, more direct layer — forcibly clearing every
+    cloud-credential field on the constructed Settings object itself,
+    regardless of what path it might otherwise have been populated
+    from — actually closes this gap, tested against the exact same
+    real .env file scenario that reproduced the original bug.
+    """
+    env_path = ".env"
+    env_already_existed = os.path.exists(env_path)
+    original_content = None
+    if env_already_existed:
+        with open(env_path) as f:
+            original_content = f.read()
+
+    try:
+        with open(env_path, "w") as f:
+            f.write(
+                "STRIPE_API_KEY=sk_test_real_looking_fake_key_from_dotenv_file\n"
+                "EASYPOST_API_KEY=EZAK_real_looking_fake_from_dotenv_file\n"
+            )
+
+        from app.main import app
+        with TestClient(app) as client:
+            resp = client.post("/api/v1/testing/golden-set/run", json={
+                "label": "stripe-isolation-test",
+                "scenario_names": ["scenario_circuit_breaker_fails_fast", "scenario_multi_cause_diagnosis"],
+            })
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["pass_count"] == data["total_count"] == 2, (
+            f"expected both scenarios to pass using the fake gateway despite a real .env file "
+            f"with fake-but-real-looking Stripe/EasyPost credentials present — got: {data}"
+        )
+        for r in data["results"]:
+            assert "CRASHED" not in r["detail"], f"{r['name']} crashed: {r['detail']}"
+    finally:
+        if env_already_existed:
+            with open(env_path, "w") as f:
+                f.write(original_content)
+        elif os.path.exists(env_path):
+            os.remove(env_path)

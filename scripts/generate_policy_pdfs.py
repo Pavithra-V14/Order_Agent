@@ -74,6 +74,9 @@ def build_return_policy_2025a():
     story.append(Paragraph("Document ID: RET-POLICY-2025-A &nbsp;|&nbsp; Version: 1 &nbsp;|&nbsp; "
                             "Effective: 2025-01-01 to 2026-01-31 &nbsp;|&nbsp; Superseded by: RET-POLICY-2026-A",
                             meta_style))
+    story.append(Paragraph(
+        "Return Windows (days): apparel=180, footwear=180, electronics=30, home=180, beauty=45, all=180",
+        meta_style))
     story.append(Spacer(1, 14))
 
     story.append(Paragraph(
@@ -136,6 +139,9 @@ def build_return_policy_2026a():
     story.append(Paragraph("Document ID: RET-POLICY-2026-A &nbsp;|&nbsp; Version: 2 &nbsp;|&nbsp; "
                             "Effective: 2026-02-01 to present &nbsp;|&nbsp; Supersedes: RET-POLICY-2025-A",
                             meta_style))
+    story.append(Paragraph(
+        "Return Windows (days): apparel=120, footwear=120, electronics=30, home=120, beauty=45, all=120",
+        meta_style))
     story.append(Spacer(1, 14))
 
     story.append(Paragraph(

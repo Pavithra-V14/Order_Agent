@@ -194,10 +194,22 @@ def _build_graphiti_client():
     llm_client = OpenAIGenericClient(
         config=LLMConfig(
             api_key=settings.groq_api_key,
-            model=settings.router_model,
+            model=settings.graphiti_router_model,
             base_url="https://api.groq.com/openai/v1",
         ),
-        structured_output_mode="json_object",
+        # json_schema (graphiti_core's own actual default) — NOT
+        # json_object. Found and fixed a real production bug directly:
+        # this was previously forced to json_object specifically because
+        # the main pipeline's model (gpt-oss-120b) doesn't reliably
+        # support json_schema for this kind of call — but json_object
+        # only guarantees VALID JSON, not that it matches the exact
+        # shape Graphiti's own internal schemas (e.g. SummarizedEntities)
+        # require, causing a real, reproducible Pydantic validation
+        # failure ("Field required: summaries") during a real Neo4j
+        # write. graphiti_router_model is a model Groq documents as
+        # reliably supporting json_schema, so this can now use the
+        # stronger, schema-enforced mode instead of guessing.
+        structured_output_mode="json_schema",
     )
     embedder = _ProjectEmbedderAdapter()
 
@@ -263,7 +275,7 @@ def reset_graphiti_client() -> None:
     _kuzu_driver_singleton = None
 
 
-GRAPHITI_CALL_TIMEOUT_SECONDS = 15.0
+GRAPHITI_CALL_TIMEOUT_SECONDS = 30.0
 
 
 def _run_async(coro):
@@ -276,15 +288,32 @@ def _run_async(coro):
     (Neo4j or Groq) stalls; an earlier version of this function let a
     Neo4j connectivity problem retry for MINUTES with escalating delays
     before finally raising.
+
+    Raised from 15.0s to 30.0s after a real, reproducible timeout: a
+    genuine production run hit this exact timeout even though Neo4j
+    Aura and Groq were BOTH independently confirmed reachable and
+    correctly configured moments later (via scripts/test_neo4j_connection.py
+    and scripts/test_groq_connection.py) — meaning 15s was too tight for
+    what this call actually does, not a sign of misconfiguration. Every
+    Graphiti call builds a brand-new Neo4j driver connection from
+    scratch (by design — see _build_graphiti_client()'s docstring on
+    event-loop safety), waits for its index/constraint setup to
+    complete, then runs the actual query — three real network
+    round-trips to a free-tier Aura instance, whose latency can
+    genuinely vary, all inside one timeout window. 30s gives that
+    realistic headroom while still bounding the wait to something
+    reasonable, not unbounded.
     """
     try:
         return asyncio.run(asyncio.wait_for(coro, timeout=GRAPHITI_CALL_TIMEOUT_SECONDS))
     except asyncio.TimeoutError:
         raise RuntimeError(
-            f"Graphiti call did not complete within {GRAPHITI_CALL_TIMEOUT_SECONDS}s — this almost "
-            f"always means either Neo4j (NEO4J_URI) or Groq (GROQ_API_KEY) is unreachable or "
-            f"misconfigured, not a normal slow response. Check both independently before retrying — "
-            f"see the troubleshooting scripts mentioned in this project's README."
+            f"Graphiti call did not complete within {GRAPHITI_CALL_TIMEOUT_SECONDS}s — this usually "
+            f"means either Neo4j (NEO4J_URI) or Groq (GROQ_API_KEY) is unreachable or misconfigured. "
+            f"But if scripts/test_neo4j_connection.py and scripts/test_groq_connection.py BOTH "
+            f"succeed independently, this is more likely a genuine transient slowdown (a free-tier "
+            f"Aura instance waking from an idle/paused state, or momentary network latency) than a "
+            f"real misconfiguration — simply retrying often succeeds."
         ) from None
 
 

@@ -6,15 +6,17 @@ outright regardless of model output — all route correctly."
 import pytest
 
 from app.guardrails.schema import ResolutionDecision, ResolutionAction, CitedPolicy, RoutingOutcome
-from app.agents.resolution_policy_workflow import run_resolution_policy_workflow
+from app.agents.resolution_policy_workflow import run_resolution_policy_workflow, propose_resolution_decision
 
 # ---------------------------------------------------------------------------
 # THE three core Phase 7 DoD scenarios
 # ---------------------------------------------------------------------------
 def test_case_auto_executable():
-    """Normal, low-value, high-confidence, no fraud flag, valid citation -> AUTO_EXECUTE."""
+    """Normal, low-value, high-confidence, no fraud flag, valid citation,
+    AND a genuinely succeeded payment (a refund only makes sense when
+    money was actually taken) -> AUTO_EXECUTE."""
     result = run_resolution_policy_workflow(
-        diagnosis_root_causes=["payment_issue: transaction status is 'declined'"],
+        diagnosis_root_causes=["payment_issue: duplicate charge detected for this order"],
         inventory_result={"any_shortfall": False},
         order_amount_usd=30.0,
         fraud_flag_present=False,
@@ -22,10 +24,178 @@ def test_case_auto_executable():
         auto_execute_value_ceiling_usd=50.0,
         retrieved_policy_doc_id="RET-POLICY-2025-A",
         retrieved_policy_version="1",
+        payment_status="succeeded",
     )
     assert result.routing == RoutingOutcome.AUTO_EXECUTE
     assert result.tier1_passed and result.tier2_passed
     assert result.decision.action == ResolutionAction.REFUND
+
+
+def test_payment_issue_with_no_successful_charge_escalates_not_refunds():
+    """THE regression test for a real bug found by actually running
+    against real Stripe: 'This PaymentIntent does not have a successful
+    charge to refund.' A payment that was NEVER successfully charged
+    (declined, requires_payment_method, canceled, etc.) has nothing to
+    refund — the original decision logic's own reasoning text even
+    admitted this ('refunding... since the customer was never
+    successfully charged') while still proposing a refund anyway, an
+    internally contradictory decision that only a real payment gateway
+    enforcing the real-world rule ever caught."""
+    result = run_resolution_policy_workflow(
+        diagnosis_root_causes=["payment_issue: payment method required or payment failed"],
+        inventory_result={"any_shortfall": False},
+        order_amount_usd=45.0,
+        fraud_flag_present=False,
+        auto_execute_confidence_threshold=0.90,
+        auto_execute_value_ceiling_usd=50.0,
+        retrieved_policy_doc_id="RET-POLICY-2025-A",
+        retrieved_policy_version="1",
+        payment_status="requires_payment_method",  # a real Stripe status meaning never charged
+    )
+    assert result.decision.action == ResolutionAction.DENY
+    assert result.decision.amount_usd == 0.0
+    assert result.routing == RoutingOutcome.ESCALATE, (
+        "must escalate for human review, not silently auto-deny either — this needs a person to "
+        "decide the actual next step (new payment method, cancel, etc.), not an automated non-decision"
+    )
+
+
+def test_carrier_issue_with_stock_available_proposes_reship_not_refund():
+    """THE regression test for a real gap found directly: RESHIP was a
+    fully-supported execution action (a real carrier label actually
+    gets generated) but this decision logic never selected it — a lost/
+    damaged-in-transit package always got refunded instead, even when
+    reshipping the same item was the more appropriate real response."""
+    result = run_resolution_policy_workflow(
+        diagnosis_root_causes=["carrier_issue: tracking status is 'lost'"],
+        inventory_result={"any_shortfall": False},
+        order_amount_usd=45.0,
+        fraud_flag_present=False,
+        auto_execute_confidence_threshold=0.90,
+        auto_execute_value_ceiling_usd=50.0,
+        retrieved_policy_doc_id="RET-POLICY-2025-A",
+        retrieved_policy_version="1",
+    )
+    assert result.decision.action == ResolutionAction.RESHIP
+    assert result.decision.amount_usd == 0.0
+    assert result.routing == RoutingOutcome.AUTO_EXECUTE
+
+
+def test_carrier_issue_with_shortfall_falls_back_to_refund():
+    """The sensible fallback: you can't reship an item you don't have in
+    stock — a carrier issue with an inventory shortfall must still
+    refund, not attempt a reship that would immediately fail."""
+    result = run_resolution_policy_workflow(
+        diagnosis_root_causes=["carrier_issue: tracking status is 'lost'"],
+        inventory_result={"any_shortfall": True},
+        order_amount_usd=45.0,
+        fraud_flag_present=False,
+        auto_execute_confidence_threshold=0.90,
+        auto_execute_value_ceiling_usd=50.0,
+        retrieved_policy_doc_id="RET-POLICY-2025-A",
+        retrieved_policy_version="1",
+    )
+    assert result.decision.action == ResolutionAction.REFUND
+    assert result.decision.amount_usd == 45.0
+
+
+def test_no_anomaly_within_return_window_approves_refund_not_denial():
+    """THE regression test for a real, meaningful gap found by actually
+    running this system: "no_anomaly_detected" (the MOST COMMON real
+    case — a customer returning an item they simply don't want, nothing
+    operationally broken) was unconditionally DENIED, which is backwards
+    from how return policies actually work. This proves a plain return
+    within the cited policy's window now correctly gets approved."""
+    from datetime import date, timedelta
+    purchase_date = (date.today() - timedelta(days=10)).isoformat()
+
+    decision = propose_resolution_decision(
+        diagnosis_root_causes=["no_anomaly_detected: all checked systems report normal state"],
+        inventory_result={"any_shortfall": False},
+        order_amount_usd=45.0,
+        retrieved_policy_doc_id="RET-POLICY-2025-A",
+        retrieved_policy_version="1",
+        purchase_date=purchase_date,
+        product_category="apparel",
+        return_window_days_by_category={"apparel": 180, "all": 180},
+    )
+    assert decision.action == ResolutionAction.REFUND
+    assert decision.amount_usd == 45.0
+    assert decision.cited_policy is not None
+
+
+def test_no_anomaly_outside_return_window_denies_with_clear_reason():
+    """The other half: a plain return request made LONG after the
+    return window closed must still be denied - this fix approves
+    returns within policy, it doesn't remove the window check entirely."""
+    from datetime import date, timedelta
+    purchase_date = (date.today() - timedelta(days=200)).isoformat()
+
+    decision = propose_resolution_decision(
+        diagnosis_root_causes=["no_anomaly_detected: all checked systems report normal state"],
+        inventory_result={"any_shortfall": False},
+        order_amount_usd=45.0,
+        retrieved_policy_doc_id="RET-POLICY-2025-A",
+        retrieved_policy_version="1",
+        purchase_date=purchase_date,
+        product_category="apparel",
+        return_window_days_by_category={"apparel": 180, "all": 180},
+    )
+    assert decision.action == ResolutionAction.DENY
+    assert "200" in decision.reasoning
+    assert "180" in decision.reasoning
+
+
+def test_no_anomaly_uses_category_specific_window_not_generic_all():
+    """The window genuinely differs by category within the SAME policy
+    (electronics=30 days vs apparel=180 days) - this proves the
+    category-specific lookup is actually used, not just the 'all'
+    catch-all regardless of what category the order actually is."""
+    from datetime import date, timedelta
+    purchase_date = (date.today() - timedelta(days=45)).isoformat()  # within apparel's window, outside electronics'
+
+    decision_electronics = propose_resolution_decision(
+        diagnosis_root_causes=["no_anomaly_detected: all checked systems report normal state"],
+        inventory_result={"any_shortfall": False},
+        order_amount_usd=200.0,
+        retrieved_policy_doc_id="RET-POLICY-2025-A",
+        retrieved_policy_version="1",
+        purchase_date=purchase_date,
+        product_category="electronics",
+        return_window_days_by_category={"apparel": 180, "electronics": 30, "all": 180},
+    )
+    assert decision_electronics.action == ResolutionAction.DENY, (
+        "electronics has a 30-day window - 45 days ago must be denied, even though "
+        "the generic 'all' window (180) would have approved it"
+    )
+
+    decision_apparel = propose_resolution_decision(
+        diagnosis_root_causes=["no_anomaly_detected: all checked systems report normal state"],
+        inventory_result={"any_shortfall": False},
+        order_amount_usd=45.0,
+        retrieved_policy_doc_id="RET-POLICY-2025-A",
+        retrieved_policy_version="1",
+        purchase_date=purchase_date,
+        product_category="apparel",
+        return_window_days_by_category={"apparel": 180, "electronics": 30, "all": 180},
+    )
+    assert decision_apparel.action == ResolutionAction.REFUND
+
+
+def test_no_anomaly_without_window_data_denies_with_low_confidence_not_a_guess():
+    """When purchase_date/category/window data genuinely isn't available
+    (e.g. a caller invoking propose_resolution_decision() directly
+    without them), this must NOT silently guess either way - a
+    low-confidence denial that would correctly route to ESCALATE rather
+    than auto-execute, since the confidence sits below any reasonable
+    auto-execute threshold."""
+    decision = propose_resolution_decision(
+        diagnosis_root_causes=["no_anomaly_detected: all checked systems report normal state"],
+        inventory_result={"any_shortfall": False},
+        order_amount_usd=45.0,
+    )
+    assert decision.action == ResolutionAction.DENY
+    assert decision.confidence < 0.90, "must be low-confidence enough to force ESCALATE, not auto-execute a guess"
 
 def test_case_escalation_fraud_flag():
     """Otherwise-clean, high-confidence decision, but a fraud flag is

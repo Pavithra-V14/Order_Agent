@@ -38,12 +38,27 @@ _EVENT_MAP = {
 def complete_resolution(
     db: Session, case: ExceptionCase, proposed_decision: ResolutionDecision,
     final_decision: ResolutionDecision, decided_by: str, action_label: str,
+    payment_intent_id: str = None,
 ) -> dict:
     """Executes a resolution decision and completes the case's
     lifecycle - usable for BOTH the human-approved path (escalations.py)
     and the auto-execute path (orchestrator.py's run_full_case_pipeline),
     which is the whole point: previously these were two different, only
     partially-implemented code paths.
+
+    payment_intent_id: an explicit override, preferred over the order's
+    own stored value when given. Found necessary from a real production
+    bug: this function previously ALWAYS re-derived payment_intent_id
+    from the order's stored DB record, silently ignoring whatever was
+    passed to run_full_case_pipeline()'s own payment_intent_id
+    parameter. An order created once, then reused across many later
+    demo runs each creating a FRESH real Stripe payment, kept forever
+    executing against the ORIGINAL stale payment_intent_id stored on
+    the order from whenever it was first created — a real, reproducible
+    "No such payment_intent" error, since passing a new ID to the
+    top-level pipeline function had no actual effect on what execution
+    used. Falls back to the order's stored value when no override is
+    given, preserving the existing escalations.py caller's behavior.
     """
     record_resolution_outcome(
         db, case_id=case.id, cluster_key=f"{case.exception_type}_{case.channel}",
@@ -53,9 +68,10 @@ def complete_resolution(
     )
 
     order = get_order(db, case.order_id)
+    resolved_payment_intent_id = payment_intent_id or (order.get("payment_intent_id") if order else None)
     exec_result = execute_resolution(
         db, case_id=case.id, decision=final_decision, order_id=case.order_id,
-        payment_intent_id=order.get("payment_intent_id") if order else None,
+        payment_intent_id=resolved_payment_intent_id,
     )
 
     case.resolution_decision = final_decision.model_dump(mode="json")
@@ -92,6 +108,22 @@ def complete_resolution(
     except Exception as e:
         import logging
         logging.getLogger("resolution_completion").warning("log_episode failed (non-fatal): %s", e)
+        # A real production enterprise system needs this to be visible
+        # and monitorable, not just a warning line in a log file nobody
+        # may ever read. Found directly: a genuine Pydantic validation
+        # error inside Graphiti's own internal LLM call silently meant
+        # this customer's case-resolution history never made it into
+        # the fraud-risk knowledge graph — correctly non-fatal to THIS
+        # case, but a real, cumulative gap if it keeps happening
+        # unnoticed. Uses the same alerting mechanism already in place
+        # for circuit breaker trips, not a new, separate mechanism.
+        from app.core.alerting import send_alert
+        try:
+            send_alert(db, "log_episode_failure", {
+                "case_id": case.id, "customer_id": case.customer_id, "error": str(e),
+            })
+        except Exception:
+            pass  # alerting itself must never be what breaks case resolution
 
     db.commit()
 

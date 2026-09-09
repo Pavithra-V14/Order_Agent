@@ -56,6 +56,23 @@ class Settings(BaseSettings):
     cohere_api_key: str | None = None
 
     router_model: str = "llama-3.3-70b-versatile"       # Groq-hosted
+    # Separate from router_model in principle (so a future Graphiti-
+    # specific need doesn't have to follow the main pipeline's model),
+    # but currently the SAME value: moonshotai/kimi-k2-instruct-0905 was
+    # tried here first and found, via a real 404 from Groq's own API,
+    # to have been deprecated outright (confirmed directly against
+    # Groq's own deprecation announcements: retired March 23, 2026, in
+    # favor of openai/gpt-oss-120b). Groq has similarly deprecated most
+    # other alternatives (Kimi K2, Llama 4 Maverick, Llama Guard 4,
+    # Qwen3-32B, Llama 4 Scout) — ALL in favor of gpt-oss-120b, leaving
+    # it as the realistic, actively-maintained choice rather than one
+    # option among several. If gpt-oss-120b's structured-output
+    # reliability (a community-reported concern from October 2025) is
+    # still an issue, log_episode_failure alerts (see app/core/alerting.py)
+    # will surface it directly — falling back to structured_output_mode=
+    # "json_object" in graphiti_adapter.py is the documented recovery
+    # path if so, not a silent guess.
+    graphiti_router_model: str = "openai/gpt-oss-120b"
     reasoning_model: str = "mistral-large-latest"         # Mistral La Plateforme
     generation_model: str = "gemini-2.0-flash"             # Google AI Studio
 

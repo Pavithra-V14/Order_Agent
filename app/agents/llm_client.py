@@ -100,6 +100,12 @@ class GroqClient(BaseLLMClient):
             "You are the Diagnosis Agent for an order-exception resolution system. Given the "
             "case context and findings gathered so far, decide the NEXT single action to take. "
             "Valid actions: check_order, check_payment, check_inventory, check_carrier, conclude. "
+            "CRITICAL: never choose an action whose corresponding key already exists in "
+            "findings_so_far (e.g. if findings_so_far already has a 'carrier' key, do NOT choose "
+            "check_carrier again — that data has already been fetched once and will not change on "
+            "a second identical call). If every check relevant to this case's context already has "
+            "an entry in findings_so_far, you MUST choose 'conclude' — do not re-request a check "
+            "just to double-check or confirm data you already have. "
             "Only choose 'conclude' once you have enough evidence to state root causes (or state "
             "'no_anomaly_detected: ...' if nothing is wrong). Respond ONLY with JSON: "
             '{"action": str, "reasoning": str, "root_causes": [str] or null}. '

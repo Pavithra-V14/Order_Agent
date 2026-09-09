@@ -52,6 +52,28 @@ def main():
     with TestClient(app) as client:
         db = SessionLocal()
         existing = get_order(db, "ORD-PIPELINE-DEMO")
+        from app.core.config import get_settings
+        settings = get_settings()
+        if settings.stripe_api_key:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from create_real_stripe_test_payment import create_real_stripe_declined_payment
+            # HONEST NOTE, worth knowing: even with a REAL, genuinely-
+            # declined PaymentIntent (fixing the "No such payment_intent"
+            # error a fake string caused), this scenario may still fail
+            # against real Stripe for a DIFFERENT, more fundamental
+            # reason — Stripe's Refund.create() requires a SUCCEEDED
+            # prior charge, and a declined payment was never actually
+            # charged. If this demo still fails, that's the real answer
+            # revealing itself: "payment declined -> refund" may not be
+            # sound business logic at all, regardless of whether the
+            # underlying payment_intent_id is real or fake. Worth fixing
+            # the underlying resolution logic if so — ask if you want
+            # that built next.
+            payment_intent_id = create_real_stripe_declined_payment(amount_usd=45.0)
+            print(f"Created real, genuinely-declined Stripe payment_intent_id: {payment_intent_id}")
+        else:
+            payment_intent_id = "pi_pipeline_demo"
+
         if existing:
             print(f"Order ORD-PIPELINE-DEMO already exists (status={existing['status']}) - reusing it.")
             print("(If you want a fully fresh run, delete/rename it in your database first,")
@@ -62,14 +84,15 @@ def main():
                 status="paid", total_amount_usd=45.0,
                 purchase_date=datetime(2025, 6, 15, tzinfo=timezone.utc),
                 line_items=[{"sku": "SKU-PIPELINE-DEMO", "category": "apparel", "qty": 1, "price": 45.0}],
-                payment_intent_id="pi_pipeline_demo",
+                payment_intent_id=payment_intent_id,
             )
         # Re-seeded unconditionally, even when the order already existed:
         # FakePaymentGateway/seed_stock's data lives in-memory (or, for
         # the real Stripe/EasyPost/Shippo gateways, is a separate live
         # system) — it does NOT persist across separate script runs the
         # way the order row in the database does.
-        get_payment_gateway().seed_transaction("pi_pipeline_demo", amount_usd=45.0, status="declined")
+        if not settings.stripe_api_key:
+            get_payment_gateway().seed_transaction(payment_intent_id, amount_usd=45.0, status="declined")
         seed_stock(db, sku="SKU-PIPELINE-DEMO", warehouse="WH-A", on_hand_qty=5, sellable_qty=5)
         db.close()
 
@@ -113,7 +136,7 @@ def main():
         result = run_full_case_pipeline(
             db2, case_id=case_id, order_id="ORD-PIPELINE-DEMO", customer_id="CUST-PIPELINE-DEMO",
             order_amount_usd=45.0, auto_execute_confidence_threshold=0.90,
-            auto_execute_value_ceiling_usd=50.0, payment_intent_id="pi_pipeline_demo",
+            auto_execute_value_ceiling_usd=50.0, payment_intent_id=payment_intent_id,
             # retrieved_policy_doc_id deliberately NOT passed — this is
             # exactly what makes the pipeline actually call RAG
             # retrieval itself instead of skipping it.
@@ -124,9 +147,18 @@ def main():
         print(f"  -> routing: {result['routing']}\n")
 
         if result["completion"]:
+            outcome = result["completion"]["outcome"]
             print(f"STEP 3 - completed automatically (routing was auto_execute)")
-            print(f"  -> final action: {result['completion']['final_action']}")
-            print(f"  -> outcome: {result['completion']['outcome']}\n")
+            print(f"  -> outcome: {outcome}")
+            if outcome == "resolved":
+                print(f"  -> final action: {result['completion']['final_action']}\n")
+            else:
+                # e.g. execution_pending_retry — the decision was
+                # approved but the actual gateway call failed. Print the
+                # real error instead of assuming success and crashing on
+                # a KeyError for a field that only exists when resolved.
+                print(f"  -> execution: {result['completion'].get('execution')}")
+                print(f"  -> error: {result['completion'].get('error')}\n")
         else:
             print(f"STEP 3 - routed to {result['routing']} — needs human review, approving now")
             print(f"  -> http://127.0.0.1:8000/escalations  (this case should be listed)\n")

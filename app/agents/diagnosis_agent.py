@@ -56,12 +56,12 @@ def _fetch_inventory(db: Session, line_items: list, case_id: str = None) -> list
     return results
 
 
-def _fetch_carrier(tracking_number: str, db: Session = None, case_id: str = None) -> dict:
+def _fetch_carrier(tracking_number: str, db: Session = None, case_id: str = None, carrier: str = None) -> dict:
     gateway = carrier_tool.get_carrier_gateway()
     if db is None:
-        return gateway.get_tracking_status(tracking_number)  # no db session available, skip tracing
+        return gateway.get_tracking_status(tracking_number, carrier=carrier)  # no db session available, skip tracing
     return record_tool_call(db, case_id or tracking_number, "carrier.get_tracking_status", False,
-                             gateway.get_tracking_status, tracking_number)
+                             gateway.get_tracking_status, tracking_number, carrier=carrier)
 
 
 def run_diagnosis(
@@ -73,6 +73,7 @@ def run_diagnosis(
     max_steps: int = 8,
     wall_clock_timeout_seconds: float = 30.0,
     case_id: str = None,
+    carrier: str = None,
 ) -> DiagnosisResult:
     """Runs the iterative diagnosis loop. case_context passed to the LLM
     planner is intentionally thin (just order_id) - the planner discovers
@@ -101,25 +102,68 @@ def run_diagnosis(
                 steps_taken=steps_taken, terminated_reason="concluded",
             )
 
+        # Defensive backstop against a real LLM re-requesting a check
+        # whose data already exists — found from an actual production
+        # run: a real Groq model called check_carrier 7 TIMES in a row
+        # despite already having a clear "returned" status from the
+        # first call, never reaching "conclude" and burning the entire
+        # step ceiling. The system prompt now explicitly instructs
+        # against this, but prompting alone can't be fully relied on —
+        # this skips the WASTED real API call (Shippo/Stripe/etc.) a
+        # redundant request would otherwise make, regardless of why the
+        # model asked for it again, and nudges toward concluding instead
+        # of silently repeating the same real network call for no new
+        # information.
+        _redundant_check_map = {"check_order": "order", "check_payment": "payment",
+                                 "check_inventory": "inventory", "check_carrier": "carrier"}
+        redundant_key = _redundant_check_map.get(plan.action)
+        if redundant_key and redundant_key in findings:
+            steps_taken.append({
+                "step": step_num, "action": f"skipped_redundant_{plan.action}",
+                "reasoning": f"'{redundant_key}' was already fetched in an earlier step — "
+                             f"not repeating a real API call for data that won't change.",
+            })
+            continue
+
         if plan.action == "check_order":
-            order = _fetch_order(db, order_id, case_id=case_id)
-            findings["order"] = order if order else {"error": "order not found"}
+            try:
+                order = _fetch_order(db, order_id, case_id=case_id)
+                findings["order"] = order if order else {"error": "order not found"}
+            except Exception as e:
+                # A single check failing must NOT crash the whole
+                # diagnosis loop — found from a real production crash:
+                # a genuine Stripe API error (payment_intent doesn't
+                # exist) propagated all the way up through diagnosis,
+                # through the LangGraph pipeline, and crashed the entire
+                # script with an unhandled traceback, instead of being
+                # treated as "this one check failed" so diagnosis could
+                # still conclude from whatever other checks succeeded.
+                findings["order"] = {"error": str(e)}
             steps_taken.append({"step": step_num, "action": "check_order", "reasoning": plan.reasoning})
             continue
 
         if plan.action == "check_payment" and payment_intent_id:
-            findings["payment"] = _fetch_payment(payment_intent_id, db=db, case_id=case_id)
+            try:
+                findings["payment"] = _fetch_payment(payment_intent_id, db=db, case_id=case_id)
+            except Exception as e:
+                findings["payment"] = {"error": str(e)}
             steps_taken.append({"step": step_num, "action": "check_payment", "reasoning": plan.reasoning})
             continue
 
         if plan.action == "check_inventory":
             line_items = findings.get("order", {}).get("line_items", [])
-            findings["inventory"] = _fetch_inventory(db, line_items, case_id=case_id)
+            try:
+                findings["inventory"] = _fetch_inventory(db, line_items, case_id=case_id)
+            except Exception as e:
+                findings["inventory"] = {"error": str(e)}
             steps_taken.append({"step": step_num, "action": "check_inventory", "reasoning": plan.reasoning})
             continue
 
         if plan.action == "check_carrier" and tracking_number:
-            findings["carrier"] = _fetch_carrier(tracking_number, db=db, case_id=case_id)
+            try:
+                findings["carrier"] = _fetch_carrier(tracking_number, db=db, case_id=case_id, carrier=carrier)
+            except Exception as e:
+                findings["carrier"] = {"error": str(e)}
             steps_taken.append({"step": step_num, "action": "check_carrier", "reasoning": plan.reasoning})
             continue
 
@@ -140,7 +184,7 @@ def run_diagnosis(
 
 
 def run_parallel_initial_fanout(db: Session, order: dict, payment_intent_id: str,
-                                 tracking_number: str, case_id: str = None) -> dict:
+                                 tracking_number: str, case_id: str = None, carrier: str = None) -> dict:
     """Once the order is known, independent reads (payment, inventory,
     carrier) run concurrently rather than sequentially. Returns a findings
     dict usable as a fast-path seed for the loop above."""
@@ -151,7 +195,7 @@ def run_parallel_initial_fanout(db: Session, order: dict, payment_intent_id: str
         if order.get("line_items"):
             tasks["inventory"] = executor.submit(_fetch_inventory, db, order["line_items"], case_id)
         if tracking_number:
-            tasks["carrier"] = executor.submit(_fetch_carrier, tracking_number, db, case_id)
+            tasks["carrier"] = executor.submit(_fetch_carrier, tracking_number, db, case_id, carrier)
 
         results = {"order": order}
         for key, future in tasks.items():

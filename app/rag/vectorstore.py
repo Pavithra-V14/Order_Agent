@@ -104,6 +104,35 @@ def ensure_collection(client: QdrantClient, collection: str, dim: int) -> None:
         )
 
 
+def refresh_node_metadata(client: QdrantClient, collection: str, node_ids: list[str], metadata: dict) -> None:
+    """Updates ONLY the document-level metadata fields on already-embedded
+    points, without touching their vectors or re-computing embeddings —
+    Qdrant's set_payload is a cheap, vector-untouched operation, exactly
+    the right tool for this.
+
+    Fixes a real, previously-undiscovered bug found from an actual
+    production run: incremental reindexing's skip logic operates at the
+    per-CHUNK text-hash level (skip re-embedding if this specific
+    chunk's text hasn't changed) — but document-level metadata (like
+    return_window_days_by_category, added after the original ingestion)
+    is the SAME for every chunk of a document, and can change
+    independent of any individual chunk's text. A chunk whose text
+    genuinely never changed was never re-upserted at all under the old
+    logic, so it silently kept whatever metadata existed at the moment
+    it was FIRST embedded — forever, even after a real metadata schema
+    change and a full re-ingestion run. A live deployment ingested an
+    updated return-policy PDF specifically to pick up a new field, and
+    the majority of its chunks (unchanged text) kept the stale metadata
+    indefinitely, causing a real resolution decision to route to
+    low-confidence denial for lack of data that had, in fact, already
+    been re-ingested — just not applied to the specific chunk retrieval
+    happened to return.
+    """
+    if not node_ids:
+        return
+    client.set_payload(collection_name=collection, payload=metadata, points=node_ids)
+
+
 def upsert_nodes(client: QdrantClient, collection: str, nodes: list[RagNode], vectors: np.ndarray) -> None:
     points = []
     for node, vec in zip(nodes, vectors):

@@ -84,7 +84,18 @@ def test_diagnosis_result_root_causes_contract_matches_resolution_workflow_input
         inventory_result={"any_shortfall": False},
         order_amount_usd=50.0,
     )
-    assert decision.action.value == "refund"
+    # The underlying transaction was seeded as "declined" — genuinely
+    # never charged — so the correct decision is DENY (escalate for
+    # human review), not REFUND. An earlier version of this assertion
+    # expected "refund" here, matching a real bug this exact contract
+    # test never caught: refunding a payment that was never
+    # successfully charged is nonsensical, and real Stripe correctly
+    # rejects it ("This PaymentIntent does not have a successful
+    # charge to refund"). payment_status isn't passed here at all
+    # (this test calls propose_resolution_decision directly, bypassing
+    # the orchestrator's automatic extraction), so this correctly
+    # falls to the "cannot confirm a successful charge" branch.
+    assert decision.action.value == "deny"
     db.close()
 
 def test_inventory_agent_output_contract_matches_resolution_workflow_input():
@@ -138,7 +149,7 @@ def test_resolution_result_contract_matches_execution_agent_input(isolated_db):
     from app.guardrails.schema import ResolutionDecision
 
     db = isolated_db.SessionLocal()
-    get_payment_gateway().seed_transaction("pi_contract_3", amount_usd=30.0)
+    get_payment_gateway().seed_transaction("pi_contract_3", amount_usd=30.0)  # defaults to status="succeeded"
 
     result = run_resolution_policy_workflow(
         diagnosis_root_causes=["payment_issue: transaction status is 'declined'"],
@@ -146,6 +157,13 @@ def test_resolution_result_contract_matches_execution_agent_input(isolated_db):
         fraud_flag_present=False, auto_execute_confidence_threshold=0.90,
         auto_execute_value_ceiling_usd=50.0, retrieved_policy_doc_id="RET-POLICY-2025-A",
         retrieved_policy_version="1",
+        # Matches the actually-seeded transaction status above — the
+        # orchestrator normally extracts and passes this automatically
+        # from real diagnosis findings; this test calls
+        # run_resolution_policy_workflow directly, so it must supply
+        # the same real value itself to keep the scenario internally
+        # consistent (a genuinely succeeded payment IS refundable).
+        payment_status="succeeded",
     )
     assert isinstance(result.decision, ResolutionDecision), (
         "execute_resolution() accesses decision.action/.amount_usd as attributes - "

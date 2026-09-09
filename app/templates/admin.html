@@ -7,6 +7,13 @@
 </div>
 
 <div class="panel" style="max-width:640px; margin-bottom:16px;">
+  <h2>Recent Alerts</h2>
+  <p class="rationale-text">Circuit breaker trips, idempotency collisions, Tier 1 blocks, and memory-write failures.</p>
+  <button id="btn-check-alerts">Check Recent Alerts</button>
+  <div id="alerts-result" style="margin-top:12px;"></div>
+</div>
+
+<div class="panel" style="max-width:640px; margin-bottom:16px;">
   <h2>Backend Status</h2>
   <p class="rationale-text">Which real implementation is active for each swappable component, right now, based on your actual configuration.</p>
   <button id="btn-check-backend-status">Check Backend Status</button>
@@ -38,6 +45,24 @@
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
 }); }
+
+document.getElementById('btn-check-alerts').addEventListener('click', async function () {
+  const resultEl = document.getElementById('alerts-result');
+  resultEl.innerHTML = '<div class="rationale-text">Checking...</div>';
+  const resp = await fetch('/api/v1/admin/alerts');
+  const alerts = await resp.json();
+  if (!alerts.length) {
+    resultEl.innerHTML = '<div class="empty-state">No alerts recorded.</div>';
+    return;
+  }
+  const rows = alerts.map(function (a) {
+    const badgeCls = a.event_type === 'log_episode_failure' ? 'escalated' : 'blocked';
+    return '<tr><td>' + esc(new Date(a.created_at).toLocaleString()) + '</td>' +
+           '<td>' + badge(a.event_type, badgeCls) + '</td>' +
+           '<td class="rationale-text">' + esc(JSON.stringify(a.detail)) + '</td></tr>';
+  }).join('');
+  resultEl.innerHTML = '<table><thead><tr><th>When</th><th>Type</th><th>Detail</th></tr></thead><tbody>' + rows + '</tbody></table>';
+});
 
 document.getElementById('btn-check-backend-status').addEventListener('click', async function () {
   const resultEl = document.getElementById('backend-status-result');

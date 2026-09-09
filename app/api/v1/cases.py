@@ -75,8 +75,31 @@ def get_case(case_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("", response_model=list[CaseResponse])
-def list_cases(db: Session = Depends(get_db)):
-    return db.query(ExceptionCase).order_by(ExceptionCase.created_at.desc()).all()
+def list_cases(exception_type: str = None, state: str = None, db: Session = Depends(get_db)):
+    """Optional filters, added directly in response to "I want to view
+    all case types in the UI" — this endpoint previously took zero
+    query parameters at all, always returning every case regardless of
+    type or lifecycle state, despite both fields being genuinely
+    meaningful to filter by."""
+    query = db.query(ExceptionCase)
+    if exception_type:
+        query = query.filter(ExceptionCase.exception_type == exception_type)
+    if state:
+        query = query.filter(ExceptionCase.state == state)
+    return query.order_by(ExceptionCase.created_at.desc()).all()
+
+
+@router.get("/meta/exception-types")
+def list_exception_types_seen(db: Session = Depends(get_db)):
+    """Every exception_type value that ACTUALLY exists in the database
+    right now — not a hardcoded list of documented-but-possibly-unused
+    values (the API schema documents payment/inventory/carrier/return/
+    fraud, but not every one of those has ever been assigned by real
+    code). Lets the UI's filter dropdown show only options that will
+    ever return a result, and update automatically if new types appear."""
+    from sqlalchemy import distinct
+    rows = db.query(distinct(ExceptionCase.exception_type)).all()
+    return sorted(r[0] for r in rows if r[0])
 
 
 @router.post("/{case_id}/reopen", response_model=CaseResponse)

@@ -84,6 +84,51 @@ def test_multi_cause_diagnosis_identifies_both_payment_and_inventory(isolated_db
     )
     db.close()
 
+def test_diagnosis_survives_a_failed_payment_check_instead_of_crashing(isolated_db):
+    """THE regression test for a real production crash: a genuine Stripe
+    API error (payment_intent doesn't exist — a real error message, not
+    a fabricated test scenario) propagated all the way up through
+    run_diagnosis(), through the LangGraph pipeline, and crashed the
+    entire script with an unhandled traceback. A single failed check
+    must be recorded as a failure and diagnosis must continue with
+    whatever other checks succeed, not crash outright."""
+    from app.tools.oms import create_order
+    from app.tools.wms import seed_stock
+    from app.agents.llm_client import FakeLLMClient
+    from app.agents.diagnosis_agent import run_diagnosis
+
+    db = isolated_db.SessionLocal()
+    create_order(
+        db, order_id="ORD-PAYFAIL-1", customer_id="CUST-PAYFAIL-1", channel="direct",
+        status="paid", total_amount_usd=45.0,
+        purchase_date=datetime(2025, 6, 15, tzinfo=timezone.utc),
+        line_items=[{"sku": "SKU-PAYFAIL-1", "category": "apparel", "qty": 1, "price": 45.0}],
+    )
+    seed_stock(db, sku="SKU-PAYFAIL-1", warehouse="WH-A", on_hand_qty=5, sellable_qty=5)
+
+    import app.agents.diagnosis_agent as diagnosis_module
+
+    def always_fails(*args, **kwargs):
+        raise RuntimeError("simulated real gateway failure: No such payment_intent: 'pi_does_not_exist'")
+
+    original_fetch_payment = diagnosis_module._fetch_payment
+    diagnosis_module._fetch_payment = always_fails
+    try:
+        result = run_diagnosis(
+            db, FakeLLMClient(), order_id="ORD-PAYFAIL-1", payment_intent_id="pi_does_not_exist",
+        )
+    finally:
+        diagnosis_module._fetch_payment = original_fetch_payment
+
+    assert result.terminated_reason in ("concluded", "diagnosis_incomplete", "max_steps_reached"), (
+        f"diagnosis must complete (in whatever terminal state), not raise — got exception instead "
+        f"of a result if this assertion is even reached"
+    )
+    assert "payment" in result.findings
+    assert "error" in result.findings["payment"], "the failed check must be recorded as a failure, not silently dropped"
+    db.close()
+
+
 def test_single_cause_case_does_not_over_report(isolated_db):
     """Sanity check the inverse: a normal, single-issue order should NOT
     spuriously report multiple causes — proves the multi-cause test above

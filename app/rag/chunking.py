@@ -38,6 +38,7 @@ def _policy_metadata_to_dict(meta: PolicyMetadata) -> dict:
         "doc_type": meta.doc_type,
         "product_category": meta.product_category,
         "channel": meta.channel,
+        "return_window_days_by_category": meta.return_window_days_by_category,
     }
 
 

@@ -18,7 +18,7 @@ logger = logging.getLogger("alerts")
 
 
 def send_alert(db: Session, event_type: str, detail: dict) -> AlertRecord:
-    """event_type: 'circuit_breaker_trip' | 'idempotency_collision' | 'tier1_block'."""
+    """event_type: 'circuit_breaker_trip' | 'idempotency_collision' | 'tier1_block' | 'log_episode_failure'."""
     logger.warning("ALERT [%s]: %s", event_type, detail)
     record = AlertRecord(event_type=event_type, detail=detail)
     db.add(record)

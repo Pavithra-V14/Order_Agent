@@ -34,6 +34,7 @@ class OrchestratorState(TypedDict, total=False):
     customer_id: str
     payment_intent_id: str
     tracking_number: str
+    carrier: str
     address_changed_same_day: bool
 
     diagnosis_findings: dict
@@ -84,6 +85,7 @@ def make_diagnosis_node(llm: BaseLLMClient):
                 payment_intent_id=state.get("payment_intent_id"),
                 tracking_number=state.get("tracking_number"),
                 case_id=state["case_id"],
+                carrier=state.get("carrier"),
             )
             db.add(AuditLogEntry(
                 case_id=state["case_id"], actor="diagnosis_agent", action="diagnosis_complete",
@@ -207,7 +209,7 @@ def build_orchestrator_graph(llm: BaseLLMClient = None):
 def run_orchestrator_for_case(case_id: str, order_id: str, customer_id: str,
                                payment_intent_id: str = None, tracking_number: str = None,
                                address_changed_same_day: bool = False,
-                               llm: BaseLLMClient = None) -> dict:
+                               llm: BaseLLMClient = None, carrier: str = None) -> dict:
     """Convenience entry point: runs the full diagnosis phase for one case
     and returns the final state (also persisted to the DB as a side effect)."""
     compiled = build_orchestrator_graph(llm)
@@ -217,6 +219,7 @@ def run_orchestrator_for_case(case_id: str, order_id: str, customer_id: str,
         "customer_id": customer_id,
         "payment_intent_id": payment_intent_id,
         "tracking_number": tracking_number,
+        "carrier": carrier,
         "address_changed_same_day": address_changed_same_day,
     }
     return compiled.invoke(initial_state)
@@ -227,7 +230,7 @@ def run_full_case_pipeline(
     auto_execute_confidence_threshold: float, auto_execute_value_ceiling_usd: float,
     payment_intent_id: str = None, tracking_number: str = None,
     address_changed_same_day: bool = False, retrieved_policy_doc_id: str = None,
-    retrieved_policy_version: str = None, llm: BaseLLMClient = None,
+    retrieved_policy_version: str = None, llm: BaseLLMClient = None, carrier: str = None,
 ) -> dict:
     """Chains diagnosis -> Resolution-Policy Workflow -> completion, all
     the way to a resolved (or escalated, or blocked) case — closing a
@@ -249,11 +252,38 @@ def run_full_case_pipeline(
     diagnosis_state = run_orchestrator_for_case(
         case_id=case_id, order_id=order_id, customer_id=customer_id,
         payment_intent_id=payment_intent_id, tracking_number=tracking_number,
-        address_changed_same_day=address_changed_same_day, llm=llm,
+        address_changed_same_day=address_changed_same_day, llm=llm, carrier=carrier,
     )
 
     from app.agents.resolution_policy_workflow import run_resolution_policy_workflow
     from app.core.db import ExceptionCase, CaseState
+
+    # THE previously-missing piece: this function used to accept
+    # retrieved_policy_doc_id/version as PARAMETERS, meaning nothing in
+    # Always fetch order context (purchase_date, product_category) —
+    # needed by the return-window check below regardless of whether RAG
+    # retrieval actually runs this call (a caller may have already
+    # supplied retrieved_policy_doc_id directly). Moving this outside
+    # the "RAG retrieval needed" branch below fixes a real gap: these
+    # were previously only computed WHEN retrieval happened, meaning a
+    # caller providing the doc_id directly would silently lose access
+    # to purchase_date/product_category for the return-window check.
+    from app.tools.oms import get_order
+    order_for_query = get_order(db, order_id)
+    purchase_date = order_for_query["purchase_date"] if order_for_query else None
+    if purchase_date and "T" in purchase_date:
+        # get_order() returns a full ISO datetime string
+        # ("2025-06-15T00:00:00"), but hybrid_search's as_of_date
+        # expects a plain date ("2025-06-15") — confirmed as a real
+        # bug by actually running this end to end, not assumed:
+        # date.fromisoformat() inside build_temporal_filter() cannot
+        # parse the full datetime form.
+        purchase_date = purchase_date.split("T")[0]
+    product_category = None
+    if order_for_query and order_for_query.get("line_items"):
+        product_category = order_for_query["line_items"][0].get("category")
+
+    return_window_days_by_category = None
 
     # THE previously-missing piece: this function used to accept
     # retrieved_policy_doc_id/version as PARAMETERS, meaning nothing in
@@ -267,22 +297,6 @@ def run_full_case_pipeline(
     # exactly that reason. This block makes the pipeline actually
     # retrieve the applicable policy via a real, traced RAG call.
     if retrieved_policy_doc_id is None:
-        case_for_query = db.get(ExceptionCase, case_id)
-        from app.tools.oms import get_order
-        order_for_query = get_order(db, order_id)
-        purchase_date = order_for_query["purchase_date"] if order_for_query else None
-        if purchase_date and "T" in purchase_date:
-            # get_order() returns a full ISO datetime string
-            # ("2025-06-15T00:00:00"), but hybrid_search's as_of_date
-            # expects a plain date ("2025-06-15") — confirmed as a real
-            # bug by actually running this end to end, not assumed:
-            # date.fromisoformat() inside build_temporal_filter() cannot
-            # parse the full datetime form.
-            purchase_date = purchase_date.split("T")[0]
-        product_category = None
-        if order_for_query and order_for_query.get("line_items"):
-            product_category = order_for_query["line_items"][0].get("category")
-
         doc_type = "fraud_policy" if bool(diagnosis_state["fraud_result"]["flag"]) else "return_policy"
         query_text = "fraud risk assessment" if doc_type == "fraud_policy" else "return window policy"
 
@@ -295,6 +309,7 @@ def run_full_case_pipeline(
             if retrieval_results:
                 retrieved_policy_doc_id = retrieval_results[0].metadata.get("doc_id")
                 retrieved_policy_version = retrieval_results[0].metadata.get("version")
+                return_window_days_by_category = retrieval_results[0].metadata.get("return_window_days_by_category")
 
     result = run_resolution_policy_workflow(
         diagnosis_root_causes=diagnosis_state["diagnosis_root_causes"],
@@ -305,6 +320,10 @@ def run_full_case_pipeline(
         auto_execute_value_ceiling_usd=auto_execute_value_ceiling_usd,
         retrieved_policy_doc_id=retrieved_policy_doc_id,
         retrieved_policy_version=retrieved_policy_version,
+        purchase_date=purchase_date,
+        product_category=product_category,
+        return_window_days_by_category=return_window_days_by_category,
+        payment_status=diagnosis_state.get("diagnosis_findings", {}).get("payment", {}).get("status"),
         db=db, case_id=case_id,
     )
 
@@ -316,6 +335,7 @@ def run_full_case_pipeline(
         completion = complete_resolution(
             db, case=case, proposed_decision=result.decision, final_decision=result.decision,
             decided_by="system:auto_execute", action_label="auto_execute",
+            payment_intent_id=payment_intent_id,
         )
         return {"routing": result.routing.value, "diagnosis": diagnosis_state, "completion": completion}
     else:

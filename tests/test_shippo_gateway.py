@@ -95,6 +95,37 @@ def test_shippo_get_tracking_status_parses_real_response_shape(shippo_settings):
     assert result["status"] == "delivered"
     assert result["tracking_number"] == "9205590164917312751089"
 
+
+@respx.mock
+def test_shippo_magic_test_tracking_token_uses_carrier_shippo(shippo_settings):
+    """THE regression test for a real mistake, corrected directly: an
+    earlier claim that 'no real carrier API lets you simulate tracking
+    status on demand' was wrong — Shippo genuinely documents exactly
+    this, via carrier='shippo' (their own reserved test-mode token, not
+    a real carrier) combined with a magic tracking number like
+    SHIPPO_DELIVERED. This proves get_tracking_status() actually
+    threads the carrier parameter through to the real request URL —
+    the previously-missing piece, since the parameter existed on the
+    method already but nothing ever passed anything but the default
+    'usps' through it in practice."""
+    from app.tools.carrier import ShippoGateway
+
+    route = respx.get(f"{SHIPPO_BASE}/tracks/shippo/SHIPPO_DELIVERED").mock(
+        return_value=httpx.Response(200, json={
+            "carrier": "shippo",
+            "tracking_number": "SHIPPO_DELIVERED",
+            "tracking_status": {"status": "DELIVERED"},
+            "tracking_history": [],
+        })
+    )
+
+    gateway = ShippoGateway()
+    result = gateway.get_tracking_status("SHIPPO_DELIVERED", carrier="shippo")
+
+    assert route.called, "must actually request the /tracks/shippo/... URL, not silently default to usps"
+    assert result["status"] == "delivered"
+
+
 @respx.mock
 def test_shippo_get_tracking_status_unknown_number_returns_unknown_not_crash(shippo_settings):
     from app.tools.carrier import ShippoGateway
@@ -208,6 +239,80 @@ def test_shippo_generate_return_label_raises_on_failed_transaction(shippo_settin
     with pytest.raises(Exception):
         gateway.generate_return_label(db, order_id="ORD-SHIPPO-4", idempotency_key="shippo-key-4")
     db.close()
+
+
+@respx.mock
+def test_shippo_falls_back_to_next_carrier_on_registration_error(shippo_settings, isolated_db):
+    """THE regression test for a real, reproducible production failure:
+    the cheapest rate happened to be UPS, which wasn't activated in the
+    account's real Shippo dashboard, producing a genuine
+    'ups_registration_error'. This is a carrier-ACTIVATION problem, not
+    a transient one - blindly retrying the same rate fails identically
+    forever. This proves the gateway now tries the next-cheapest rate
+    from a DIFFERENT carrier automatically instead of failing outright,
+    the same thing a person manually comparing rates would naturally do."""
+    from app.tools.carrier import ShippoGateway
+
+    respx.post(f"{SHIPPO_BASE}/shipments/").mock(return_value=httpx.Response(200, json={
+        "object_id": "shp_fallback_test",
+        "rates": [
+            {"object_id": "rate_ups_cheap", "amount": "5.00", "provider": "UPS"},
+            {"object_id": "rate_usps_pricier", "amount": "7.50", "provider": "USPS"},
+        ],
+    }))
+    respx.post(f"{SHIPPO_BASE}/transactions/").mock(side_effect=[
+        httpx.Response(200, json={
+            "object_id": "trans_ups_fail", "status": "ERROR",
+            "messages": [{"source": "UPS", "code": "ups_registration_error",
+                          "text": "The UPS account is not yet registered."}],
+        }),
+        httpx.Response(200, json={
+            "object_id": "trans_usps_success", "status": "SUCCESS",
+            "tracking_number": "TRACKFALLBACK123", "label_url": "https://example.com/fallback_label.pdf",
+        }),
+    ])
+
+    db = isolated_db.SessionLocal()
+    gateway = ShippoGateway()
+    result = gateway.generate_return_label(db, order_id="ORD-FALLBACK-TEST", idempotency_key="fallback-key-1")
+
+    assert result["tracking_number"] == "TRACKFALLBACK123", (
+        "must succeed using the SECOND (USPS) rate after the first (UPS) rate failed with a "
+        "registration error, not raise immediately on the first failure"
+    )
+    db.close()
+
+
+def test_shippo_raises_clean_error_when_every_carrier_is_unregistered(shippo_settings, isolated_db):
+    """If literally every rate fails with a registration error (nothing
+    activated at all), this must raise one clear, actionable error -
+    not silently return a broken result or loop forever."""
+    from app.tools.carrier import ShippoGateway
+
+    with respx.mock:
+        respx.post(f"{SHIPPO_BASE}/shipments/").mock(return_value=httpx.Response(200, json={
+            "object_id": "shp_all_fail",
+            "rates": [
+                {"object_id": "rate_ups", "amount": "5.00", "provider": "UPS"},
+                {"object_id": "rate_fedex", "amount": "6.00", "provider": "FedEx"},
+            ],
+        }))
+        respx.post(f"{SHIPPO_BASE}/transactions/").mock(side_effect=[
+            httpx.Response(200, json={
+                "object_id": "t1", "status": "ERROR",
+                "messages": [{"source": "UPS", "code": "ups_registration_error", "text": "not registered"}],
+            }),
+            httpx.Response(200, json={
+                "object_id": "t2", "status": "ERROR",
+                "messages": [{"source": "FedEx", "code": "fedex_registration_error", "text": "not registered"}],
+            }),
+        ])
+
+        db = isolated_db.SessionLocal()
+        gateway = ShippoGateway()
+        with pytest.raises(RuntimeError, match="No activated carrier"):
+            gateway.generate_return_label(db, order_id="ORD-ALL-FAIL", idempotency_key="all-fail-key")
+        db.close()
 
 @respx.mock
 def test_shippo_generate_return_label_includes_email_and_phone_on_addresses(shippo_settings, isolated_db):

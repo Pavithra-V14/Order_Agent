@@ -5,8 +5,7 @@ mirroring what reship_demo.py does for the carrier gateway.
 
 Unlike the carrier path, a refund needs a REAL, ALREADY-SUCCEEDED
 payment to refund against — you can't refund something that was never
-charged. Run scripts/create_real_stripe_test_payment.py first to create
-one, then pass its ID here.
+charged. With real Stripe configured, this creates one automatically.
 
 Usage:
     uvicorn app.main:app --reload   # separate terminal
@@ -14,8 +13,10 @@ Usage:
     # Fake gateway (no STRIPE_API_KEY set) - works immediately:
     python3 scripts/refund_demo.py
 
-    # Real Stripe - create a real refundable payment first:
-    python3 scripts/create_real_stripe_test_payment.py
+    # Real Stripe - creates a real refundable payment automatically:
+    python3 scripts/refund_demo.py
+
+    # Optional: reuse a specific existing payment_intent_id instead:
     python3 scripts/refund_demo.py pi_xxxxxxxxxxxxx
 """
 import sys
@@ -35,22 +36,24 @@ def main():
     init_db()
     db = SessionLocal()
 
-    payment_intent_id = sys.argv[1] if len(sys.argv) > 1 else "pi_refund_demo_fake"
-
     print("Checking which payment backend is active...")
     from app.core.config import get_settings
     settings = get_settings()
     if settings.stripe_api_key:
         print("  -> Stripe (real)")
-        if payment_intent_id == "pi_refund_demo_fake":
-            print("\nERROR: STRIPE_API_KEY is configured, but no real payment_intent_id was given.")
-            print("A fake ID will fail with a real Stripe 'No such payment_intent' error.")
-            print("Run this first:")
-            print("  python3 scripts/create_real_stripe_test_payment.py")
-            print("Then:")
-            print(f"  python3 scripts/refund_demo.py <the real pi_... it prints>")
-            sys.exit(1)
+        if len(sys.argv) > 1:
+            payment_intent_id = sys.argv[1]
+            print(f"Using provided Stripe payment_intent_id: {payment_intent_id}")
+        else:
+            # Creates a real, genuinely refundable Stripe test payment
+            # automatically — no separate manual step required.
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from create_real_stripe_test_payment import create_real_stripe_test_payment
+            print("Creating a real Stripe test-mode payment automatically...")
+            payment_intent_id = create_real_stripe_test_payment(amount_usd=45.0)
+            print(f"Created real Stripe payment_intent_id: {payment_intent_id}")
     else:
+        payment_intent_id = "pi_refund_demo_fake"
         print("  -> FakePaymentGateway (local) — set STRIPE_API_KEY to use real Stripe")
         get_payment_gateway().seed_transaction(payment_intent_id, amount_usd=45.0, status="succeeded")
 

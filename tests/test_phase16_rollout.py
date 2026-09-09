@@ -58,6 +58,13 @@ def test_rollback_disables_auto_execution_for_all_new_cases_in_under_5_minutes(i
         fraud_flag_present=False, auto_execute_confidence_threshold=0.90,
         auto_execute_value_ceiling_usd=50.0,
         retrieved_policy_doc_id="RET-POLICY-2025-A", retrieved_policy_version="1",
+        # A genuinely succeeded payment — the only scenario where a
+        # refund actually makes sense, per a real bug found and fixed
+        # separately (refunding a never-charged payment is nonsensical,
+        # and real Stripe correctly rejects it). Needed here so this
+        # test's ONLY variable is the rollback switch itself, not also
+        # accidentally exercising the payment-status guardrail.
+        payment_status="succeeded",
     )
     assert result_before.routing.value == "auto_execute"
 
@@ -77,6 +84,7 @@ def test_rollback_disables_auto_execution_for_all_new_cases_in_under_5_minutes(i
         fraud_flag_present=False, auto_execute_confidence_threshold=0.90,
         auto_execute_value_ceiling_usd=50.0,
         retrieved_policy_doc_id="RET-POLICY-2025-A", retrieved_policy_version="1",
+        payment_status="succeeded",
     )
     assert result_after.routing.value == "escalate"
     assert any("globally disabled" in r for r in result_after.routing_reasons)

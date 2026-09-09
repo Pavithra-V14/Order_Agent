@@ -5,7 +5,7 @@ routing decision, and the first real code path that calls log_episode().
 """
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import pytest
 
@@ -30,6 +30,51 @@ def isolated_db():
             os.remove(tmp_path)
     except PermissionError:
         pass
+
+
+@pytest.fixture(autouse=True)
+def isolated_qdrant_with_real_policies():
+    """A real, dedicated, freshly-ingested Qdrant instance for every test
+    in this file — added after finding that tests relying on RAG
+    retrieval (rather than a hardcoded retrieved_policy_doc_id) genuinely
+    need real ingested content to pass reliably. Relying on whatever
+    happens to already be in the module-level shared local Qdrant path
+    is NOT reliable: it depends entirely on what a previous, unrelated
+    test run or manual setup step happened to leave behind — confirmed
+    directly: these tests passed when the shared store happened to have
+    content, and failed identically (falling to a low-confidence
+    'missing policy citation' denial) the moment it was cleaned up, with
+    no test-visible reason why behavior differed between two runs of
+    literally the same code.
+    """
+    import shutil
+    tmp_qdrant = tempfile.mkdtemp(prefix="test_full_pipeline_qdrant_")
+    tmp_reindex_state = os.path.join(tempfile.gettempdir(), f"test_full_pipeline_reindex_{os.getpid()}_{id(object())}.json")
+    os.environ["QDRANT_LOCAL_PATH"] = tmp_qdrant
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+    import app.rag.vectorstore as vectorstore_module
+    if vectorstore_module._client_singleton is not None:
+        vectorstore_module._client_singleton.close()
+    vectorstore_module._client_singleton = None
+    vectorstore_module._client_singleton_key = None
+
+    import app.rag.ingestion as ingestion_module
+    ingestion_module._REINDEX_STATE_PATH = tmp_reindex_state
+    from app.rag.ingestion import ingest_policy_directory
+    ingest_policy_directory("data/policies")
+
+    yield
+
+    if vectorstore_module._client_singleton is not None:
+        vectorstore_module._client_singleton.close()
+    vectorstore_module._client_singleton = None
+    vectorstore_module._client_singleton_key = None
+    os.environ.pop("QDRANT_LOCAL_PATH", None)
+    get_settings.cache_clear()
+    shutil.rmtree(tmp_qdrant, ignore_errors=True)
+    if os.path.exists(tmp_reindex_state):
+        os.remove(tmp_reindex_state)
 
 
 @pytest.fixture(autouse=True)
@@ -113,11 +158,11 @@ def test_auto_execute_case_actually_gets_resolved(isolated_db):
 
     db = SessionLocal()
     create_order(db, order_id="ORD-FULLPIPE-1", customer_id="CUST-FULLPIPE-1", channel="direct",
-                 status="payment_failed", total_amount_usd=30.0,
-                 purchase_date=datetime(2025, 6, 15, tzinfo=timezone.utc),
+                 status="paid", total_amount_usd=30.0,
+                 purchase_date=datetime.now(timezone.utc) - timedelta(days=10),
                  line_items=[{"sku": "SKU-FULLPIPE-1", "category": "apparel", "qty": 1, "price": 30.0}],
                  payment_intent_id="pi_fullpipe_1")
-    get_payment_gateway().seed_transaction("pi_fullpipe_1", amount_usd=30.0, status="declined")
+    get_payment_gateway().seed_transaction("pi_fullpipe_1", amount_usd=30.0, status="succeeded")
     seed_stock(db, sku="SKU-FULLPIPE-1", warehouse="WH-A", on_hand_qty=5, sellable_qty=5)
 
     case = ExceptionCase(id="case-fullpipe-1", order_id="ORD-FULLPIPE-1", customer_id="CUST-FULLPIPE-1",
@@ -129,7 +174,6 @@ def test_auto_execute_case_actually_gets_resolved(isolated_db):
         db, case_id="case-fullpipe-1", order_id="ORD-FULLPIPE-1", customer_id="CUST-FULLPIPE-1",
         order_amount_usd=30.0, auto_execute_confidence_threshold=0.90,
         auto_execute_value_ceiling_usd=50.0, payment_intent_id="pi_fullpipe_1",
-        retrieved_policy_doc_id="RET-POLICY-2025-A", retrieved_policy_version="1",
     )
 
     assert result["routing"] == "auto_execute"
@@ -156,11 +200,11 @@ def test_auto_execute_completion_writes_a_customer_history_episode(isolated_db):
 
     db = SessionLocal()
     create_order(db, order_id="ORD-FULLPIPE-2", customer_id="CUST-FULLPIPE-2", channel="direct",
-                 status="payment_failed", total_amount_usd=25.0,
-                 purchase_date=datetime(2025, 6, 15, tzinfo=timezone.utc),
+                 status="paid", total_amount_usd=25.0,
+                 purchase_date=datetime.now(timezone.utc) - timedelta(days=10),
                  line_items=[{"sku": "SKU-FULLPIPE-2", "category": "apparel", "qty": 1, "price": 25.0}],
                  payment_intent_id="pi_fullpipe_2")
-    get_payment_gateway().seed_transaction("pi_fullpipe_2", amount_usd=25.0, status="declined")
+    get_payment_gateway().seed_transaction("pi_fullpipe_2", amount_usd=25.0, status="succeeded")
     seed_stock(db, sku="SKU-FULLPIPE-2", warehouse="WH-A", on_hand_qty=5, sellable_qty=5)
 
     case = ExceptionCase(id="case-fullpipe-2", order_id="ORD-FULLPIPE-2", customer_id="CUST-FULLPIPE-2",
@@ -175,7 +219,6 @@ def test_auto_execute_completion_writes_a_customer_history_episode(isolated_db):
         db, case_id="case-fullpipe-2", order_id="ORD-FULLPIPE-2", customer_id="CUST-FULLPIPE-2",
         order_amount_usd=25.0, auto_execute_confidence_threshold=0.90,
         auto_execute_value_ceiling_usd=50.0, payment_intent_id="pi_fullpipe_2",
-        retrieved_policy_doc_id="RET-POLICY-2025-A", retrieved_policy_version="1",
     )
 
     history_after = get_customer_history(db, "CUST-FULLPIPE-2")
@@ -245,34 +288,9 @@ def test_full_pipeline_actually_calls_real_rag_retrieval_when_no_doc_id_given(is
     This test omits retrieved_policy_doc_id entirely and confirms the
     pipeline derives it via a REAL hybrid_search call, produces an
     actual rag_retrieval trace span, and ends up with a groundedness
-    score that reflects reality rather than always being 0.
+    score that reflects reality rather than always being 0. Real Qdrant
+    setup is handled by the isolated_qdrant_with_real_policies fixture.
     """
-    import shutil
-    tmp_qdrant = tempfile.mkdtemp(prefix="test_rag_wiring_qdrant_")
-    tmp_reindex_state = os.path.join(tempfile.gettempdir(), f"test_rag_wiring_reindex_{os.getpid()}.json")
-    os.environ["QDRANT_LOCAL_PATH"] = tmp_qdrant
-    from app.core.config import get_settings
-    get_settings.cache_clear()
-    import app.rag.vectorstore as vectorstore_module
-    if vectorstore_module._client_singleton is not None:
-        vectorstore_module._client_singleton.close()
-    vectorstore_module._client_singleton = None
-    vectorstore_module._client_singleton_key = None
-
-    # Isolate the reindex-state tracker too — without this, the
-    # incremental-reindex logic reads the REAL data/reindex_state.json,
-    # sees these documents already indexed (same content hash) from a
-    # prior real ingestion run, and skips embedding them entirely —
-    # leaving this test's fresh, empty Qdrant collection with zero
-    # points despite ingest_policy_directory() appearing to "succeed".
-    # Confirmed as the actual cause by hitting exactly the resulting
-    # symptom (TfidfEmbedder unfit) before adding this isolation.
-    import app.rag.ingestion as ingestion_module
-    ingestion_module._REINDEX_STATE_PATH = tmp_reindex_state
-
-    from app.rag.ingestion import ingest_policy_directory
-    ingest_policy_directory("data/policies")
-
     from app.core.db import SessionLocal, ExceptionCase, CaseState
     from app.tools.oms import create_order
     from app.tools.wms import seed_stock
@@ -281,48 +299,37 @@ def test_full_pipeline_actually_calls_real_rag_retrieval_when_no_doc_id_given(is
     from app.core.metrics import compute_rag_metrics
 
     db = SessionLocal()
-    try:
-        create_order(db, order_id="ORD-RAG-WIRING", customer_id="CUST-RAG-WIRING", channel="direct",
-                     status="payment_failed", total_amount_usd=45.0,
-                     purchase_date=datetime(2025, 6, 15, tzinfo=timezone.utc),
-                     line_items=[{"sku": "SKU-RAG-WIRING", "category": "apparel", "qty": 1, "price": 45.0}],
-                     payment_intent_id="pi_rag_wiring")
-        get_payment_gateway().seed_transaction("pi_rag_wiring", amount_usd=45.0, status="declined")
-        seed_stock(db, sku="SKU-RAG-WIRING", warehouse="WH-A", on_hand_qty=5, sellable_qty=5)
+    create_order(db, order_id="ORD-RAG-WIRING", customer_id="CUST-RAG-WIRING", channel="direct",
+                 status="paid", total_amount_usd=45.0,
+                 purchase_date=datetime.now(timezone.utc) - timedelta(days=10),
+                 line_items=[{"sku": "SKU-RAG-WIRING", "category": "apparel", "qty": 1, "price": 45.0}],
+                 payment_intent_id="pi_rag_wiring")
+    get_payment_gateway().seed_transaction("pi_rag_wiring", amount_usd=45.0, status="succeeded")
+    seed_stock(db, sku="SKU-RAG-WIRING", warehouse="WH-A", on_hand_qty=5, sellable_qty=5)
 
-        case = ExceptionCase(id="case-rag-wiring", order_id="ORD-RAG-WIRING", customer_id="CUST-RAG-WIRING",
-                              channel="direct", exception_type="payment", state=CaseState.DETECTED)
-        db.add(case)
-        db.commit()
+    case = ExceptionCase(id="case-rag-wiring", order_id="ORD-RAG-WIRING", customer_id="CUST-RAG-WIRING",
+                          channel="direct", exception_type="payment", state=CaseState.DETECTED)
+    db.add(case)
+    db.commit()
 
-        # Deliberately NOT passing retrieved_policy_doc_id/version at all —
-        # this is the exact call shape that previously resulted in zero
-        # retrieval and zero groundedness regardless of what actually happened.
-        result = run_full_case_pipeline(
-            db, case_id="case-rag-wiring", order_id="ORD-RAG-WIRING", customer_id="CUST-RAG-WIRING",
-            order_amount_usd=45.0, auto_execute_confidence_threshold=0.90,
-            auto_execute_value_ceiling_usd=50.0, payment_intent_id="pi_rag_wiring",
-        )
+    # Deliberately NOT passing retrieved_policy_doc_id/version at all —
+    # this is the exact call shape that previously resulted in zero
+    # retrieval and zero groundedness regardless of what actually happened.
+    result = run_full_case_pipeline(
+        db, case_id="case-rag-wiring", order_id="ORD-RAG-WIRING", customer_id="CUST-RAG-WIRING",
+        order_amount_usd=45.0, auto_execute_confidence_threshold=0.90,
+        auto_execute_value_ceiling_usd=50.0, payment_intent_id="pi_rag_wiring",
+    )
 
-        assert result["routing"] == "auto_execute"
+    assert result["routing"] == "auto_execute"
 
-        metrics = compute_rag_metrics(db)
-        assert metrics["retrieval_span_count"] >= 1, (
-            "a real rag_retrieval trace span must exist — this is the exact thing that was "
-            "missing entirely before, regardless of whether the citation was 'correct'"
-        )
-        assert metrics["groundedness_score"] == 1.0, (
-            "the citation must be genuinely grounded in what was actually retrieved, not just "
-            "coincidentally non-zero"
-        )
-    finally:
-        db.close()
-        if vectorstore_module._client_singleton is not None:
-            vectorstore_module._client_singleton.close()
-        vectorstore_module._client_singleton = None
-        vectorstore_module._client_singleton_key = None
-        os.environ.pop("QDRANT_LOCAL_PATH", None)
-        get_settings.cache_clear()
-        shutil.rmtree(tmp_qdrant, ignore_errors=True)
-        if os.path.exists(tmp_reindex_state):
-            os.remove(tmp_reindex_state)
+    metrics = compute_rag_metrics(db)
+    assert metrics["retrieval_span_count"] >= 1, (
+        "a real rag_retrieval trace span must exist — this is the exact thing that was "
+        "missing entirely before, regardless of whether the citation was 'correct'"
+    )
+    assert metrics["groundedness_score"] == 1.0, (
+        "the citation must be genuinely grounded in what was actually retrieved, not just "
+        "coincidentally non-zero"
+    )
+    db.close()

@@ -15,9 +15,45 @@ exceed Tier 1's ceilings regardless of what it concludes.
 """
 from __future__ import annotations
 
+from datetime import date, datetime
+
 from app.guardrails.schema import ResolutionDecision, ResolutionAction, CitedPolicy, ResolutionResult, RoutingOutcome
 from app.guardrails.tier1_ceilings import check_tier1_ceilings
 from app.guardrails.tier2_structural import run_tier2
+
+
+def _resolve_window_days(return_window_days_by_category: dict | None, product_category: str | None) -> int | None:
+    """Looks up the applicable return window for a specific product
+    category, falling back to the policy's 'all' catch-all entry if that
+    exact category isn't listed separately — matches how the real policy
+    documents are structured (most categories get their own window, but
+    "all" covers anything not explicitly listed)."""
+    if not return_window_days_by_category:
+        return None
+    if product_category:
+        category_key = product_category.strip().lower()
+        if category_key in return_window_days_by_category:
+            return return_window_days_by_category[category_key]
+    return return_window_days_by_category.get("all")
+
+
+def _days_since(purchase_date: str | date | None) -> int | None:
+    """Computes whole days between a purchase date and today. Accepts
+    either a date object or an ISO-format string (get_order() returns
+    the latter) - returns None rather than raising if the input is
+    missing or malformed, since an unparseable date should route to the
+    "genuinely missing data" fallback in propose_resolution_decision(),
+    not crash the whole resolution workflow."""
+    if purchase_date is None:
+        return None
+    try:
+        if isinstance(purchase_date, str):
+            purchase_date = date.fromisoformat(purchase_date.split("T")[0])
+        elif isinstance(purchase_date, datetime):
+            purchase_date = purchase_date.date()
+        return (date.today() - purchase_date).days
+    except (ValueError, TypeError):
+        return None
 
 
 def propose_resolution_decision(
@@ -26,6 +62,10 @@ def propose_resolution_decision(
     order_amount_usd: float,
     retrieved_policy_doc_id: str = None,
     retrieved_policy_version: str = None,
+    purchase_date: str = None,
+    product_category: str = None,
+    return_window_days_by_category: dict = None,
+    payment_status: str = None,
 ) -> ResolutionDecision:
     """Rule-based decision proposal - bounded logic, not open reasoning.
     This is the piece that would eventually call a reasoning-tier LLM
@@ -33,10 +73,29 @@ def propose_resolution_decision(
     language, but the ACTION and AMOUNT selection logic stays rule-based
     regardless - the LLM (when wired in) drafts explanation text within
     constraints this function already determined, never picks the action
-    or amount itself."""
+    or amount itself.
+
+    purchase_date/product_category/return_window_days_by_category:
+    added to fix a real, previously-undiscovered gap found by actually
+    running this system end to end: "no_anomaly_detected" (the MOST
+    COMMON real-world case — a customer returning an item they simply
+    don't want, with nothing operationally broken about the order) was
+    unconditionally treated as grounds for DENIAL. That's backwards from
+    how return policies actually work: most legitimate returns have no
+    system fault to find and should be approved within the return
+    window, not denied for lacking a diagnosable problem. This now
+    checks the CITED policy's actual, category-specific return window
+    (return_window_days_by_category — see app/rag/metadata.py, parsed
+    from a structured line every real policy PDF states, not guessed)
+    against how long ago the order was purchased, and approves a refund
+    if within it — falling back to denial only when genuinely outside
+    the window, or when the window data isn't available at all (a
+    missing citation is still refused rather than silently approved).
+    """
     causes_text = " | ".join(diagnosis_root_causes)
     has_inventory_issue = "inventory_issue" in causes_text
     has_payment_issue = "payment_issue" in causes_text
+    has_carrier_issue = "carrier_issue" in causes_text
     has_no_anomaly = "no_anomaly_detected" in causes_text
     any_shortfall = bool(inventory_result.get("any_shortfall"))
 
@@ -49,13 +108,49 @@ def propose_resolution_decision(
         )
 
     if has_no_anomaly:
+        window_days = _resolve_window_days(return_window_days_by_category, product_category)
+        days_since_purchase = _days_since(purchase_date)
+
+        if window_days is not None and days_since_purchase is not None:
+            if days_since_purchase <= window_days:
+                return ResolutionDecision(
+                    action=ResolutionAction.REFUND,
+                    amount_usd=order_amount_usd,
+                    confidence=0.93,
+                    reasoning=f"No operational anomaly was found (payment, inventory, and carrier all "
+                              f"report normal state) — this is a standard return request, not a system "
+                              f"fault. Order was purchased {days_since_purchase} day(s) ago, within the "
+                              f"cited policy's {window_days}-day window for this product category, so "
+                              f"approving a full refund per policy terms.",
+                    cited_policy=cited,
+                )
+            return ResolutionDecision(
+                action=ResolutionAction.DENY,
+                amount_usd=0.0,
+                confidence=0.91,
+                reasoning=f"No operational anomaly was found, and this order was purchased "
+                          f"{days_since_purchase} day(s) ago — outside the cited policy's "
+                          f"{window_days}-day return window for this product category. Denying per "
+                          f"policy terms, not for lack of a diagnosable system fault.",
+                cited_policy=cited,
+            )
+
+        # Genuinely missing the data needed to check the window at all
+        # (no citation, or no purchase_date/category supplied) — refuse
+        # rather than silently approve OR silently deny without a real
+        # basis either way. This should be rare in real usage (the full
+        # pipeline always supplies these), but a caller invoking this
+        # function directly without them gets an honest, low-confidence
+        # denial that clearly explains why, not a guess.
         return ResolutionDecision(
             action=ResolutionAction.DENY,
             amount_usd=0.0,
-            confidence=0.95,
-            reasoning="No anomaly was found across order, payment, inventory, or carrier checks - "
-                      "the exception could not be substantiated against current system state.",
-            cited_policy=None,
+            confidence=0.60,
+            reasoning="No operational anomaly was found, but this order's purchase date, product "
+                      "category, or the cited policy's return-window data was not available to check "
+                      "whether it falls within the applicable return window — denying pending a proper "
+                      "policy-window check rather than guessing either way.",
+            cited_policy=cited,
         )
 
     if has_inventory_issue and any_shortfall:
@@ -68,13 +163,71 @@ def propose_resolution_decision(
             cited_policy=cited,
         )
 
-    if has_payment_issue:
+    if has_carrier_issue:
+        # A genuine gap found and fixed: RESHIP was a fully-supported
+        # execution action (a real carrier label gets generated) but was
+        # NEVER actually selected by this decision logic — a lost/
+        # damaged-in-transit package would always be refunded instead,
+        # even when reshipping the same item (with stock on hand) is the
+        # more appropriate real-world response. Only reship when
+        # inventory is actually available; fall back to refund if it
+        # isn't, since you can't reship what you don't have.
+        if not any_shortfall:
+            return ResolutionDecision(
+                action=ResolutionAction.RESHIP,
+                amount_usd=0.0,
+                confidence=0.90,
+                reasoning="Carrier tracking confirms a delivery exception (lost/damaged/returned to "
+                          "sender) and sufficient stock is available — reshipping the same item rather "
+                          "than refunding, since the customer's actual intent was to receive the product.",
+                cited_policy=cited,
+            )
         return ResolutionDecision(
             action=ResolutionAction.REFUND,
             amount_usd=order_amount_usd,
-            confidence=0.92,
-            reasoning="Payment gateway confirms the transaction did not succeed - refunding the full "
-                      "order amount since the customer was never successfully charged for a completed order.",
+            confidence=0.88,
+            reasoning="Carrier tracking confirms a delivery exception, but insufficient stock is "
+                      "available to reship the same item — refunding the full order amount instead.",
+            cited_policy=cited,
+        )
+
+    if has_payment_issue:
+        # Only a payment that was genuinely, successfully charged is
+        # refundable at all — Stripe's real Refund API confirms this
+        # directly ("This PaymentIntent does not have a successful
+        # charge to refund"). The ORIGINAL version of this branch
+        # unconditionally proposed REFUND for ANY payment_issue root
+        # cause, including its own literal reasoning text admitting
+        # "the customer was never successfully charged" — an internally
+        # contradictory decision that only surfaced as broken once run
+        # against a real payment gateway that actually enforces the
+        # real-world rule a fake gateway never checked. Real Stripe
+        # PaymentIntent statuses that mean "never actually charged":
+        # requires_payment_method, requires_confirmation, requires_action,
+        # canceled, processing (not yet settled), requires_capture
+        # (authorized but not captured — not confirmed yet either).
+        # "succeeded" is the only status that means money was genuinely
+        # taken and is refundable.
+        if payment_status == "succeeded":
+            return ResolutionDecision(
+                action=ResolutionAction.REFUND,
+                amount_usd=order_amount_usd,
+                confidence=0.92,
+                reasoning="Payment gateway confirms this payment DID succeed, but a payment_issue "
+                          "was still flagged (e.g. an incorrect charge amount or a separate billing "
+                          "dispute) - refunding the full order amount since the customer was "
+                          "genuinely, successfully charged.",
+                cited_policy=cited,
+            )
+        return ResolutionDecision(
+            action=ResolutionAction.DENY,
+            amount_usd=0.0,
+            confidence=0.40,  # deliberately low - this needs a human, not an automated denial either
+            reasoning=f"Payment gateway confirms this payment was NEVER successfully charged "
+                      f"(status={payment_status!r}) - there is nothing to refund. This needs human "
+                      f"review to determine the right next step (contact the customer for a new "
+                      f"payment method, cancel the order, or something else) rather than either an "
+                      f"automated refund of money that was never taken or a silent denial.",
             cited_policy=cited,
         )
 
@@ -101,6 +254,10 @@ def run_resolution_policy_workflow(
     override_decision: ResolutionDecision = None,
     db=None,
     case_id: str = None,
+    purchase_date: str = None,
+    product_category: str = None,
+    return_window_days_by_category: dict = None,
+    payment_status: str = None,
 ) -> ResolutionResult:
     """Full workflow: propose -> Tier 1 -> Tier 2 -> route.
 
@@ -114,6 +271,8 @@ def run_resolution_policy_workflow(
     decision = override_decision or propose_resolution_decision(
         diagnosis_root_causes, inventory_result, order_amount_usd,
         retrieved_policy_doc_id, retrieved_policy_version,
+        purchase_date, product_category, return_window_days_by_category,
+        payment_status,
     )
 
     if db is not None and case_id is not None:

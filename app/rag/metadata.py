@@ -29,6 +29,7 @@ class PolicyMetadata:
     doc_type: str                     # "return_policy" | "fraud_policy" | ...
     product_category: list[str] = field(default_factory=lambda: ["all"])
     channel: list[str] = field(default_factory=lambda: ["all"])
+    return_window_days_by_category: dict[str, int] | None = None
 
 
 _HEADER_RE = re.compile(
@@ -39,6 +40,41 @@ _HEADER_RE = re.compile(
 )
 _SUPERSEDES_RE = re.compile(r"Supersedes:\s*([A-Z0-9\-]+)", re.IGNORECASE)
 _SUPERSEDED_BY_RE = re.compile(r"Superseded by:\s*([A-Z0-9\-]+)", re.IGNORECASE)
+_RETURN_WINDOWS_RE = re.compile(r"Return Windows \(days\):\s*(.+?)(?:\n|$)", re.IGNORECASE)
+
+
+def _parse_return_windows(header_text: str) -> dict[str, int] | None:
+    """Parses the structured 'Return Windows (days): apparel=180,
+    electronics=30, ...' line every return_policy PDF states on page 1
+    (see scripts/generate_policy_pdfs.py) — the machine-readable
+    counterpart to the human-readable category table on the same page.
+
+    This exists specifically to make return-window decisions
+    (does this order qualify for an automatic refund vs. denial)
+    programmatically checkable, rather than requiring an LLM to
+    interpret prose text or a fragile regex against a formatted table —
+    the return window genuinely differs BY PRODUCT CATEGORY within the
+    same policy (apparel=180 days, electronics=30 days in the same
+    document), so a single per-policy number would be wrong.
+
+    Returns None (not an error) if this line is absent — not every
+    policy type has return windows (fraud policies don't), and this
+    field is optional precisely because of that.
+    """
+    match = _RETURN_WINDOWS_RE.search(header_text)
+    if not match:
+        return None
+    windows = {}
+    for pair in match.group(1).split(","):
+        pair = pair.strip()
+        if "=" not in pair:
+            continue
+        category, days_str = pair.split("=", 1)
+        try:
+            windows[category.strip().lower()] = int(days_str.strip())
+        except ValueError:
+            continue
+    return windows or None
 
 
 def _infer_doc_type(doc_id: str) -> str:
@@ -80,4 +116,5 @@ def parse_policy_metadata(header_text: str) -> PolicyMetadata:
         supersedes=supersedes_match.group(1) if supersedes_match else None,
         superseded_by=superseded_by_match.group(1) if superseded_by_match else None,
         doc_type=_infer_doc_type(doc_id),
+        return_window_days_by_category=_parse_return_windows(header_text),
     )

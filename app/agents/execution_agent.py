@@ -39,11 +39,38 @@ class ExecutionResult:
     error: str = ""
 
 
-def _derive_idempotency_key(case_id: str, action: ResolutionAction) -> str:
-    """Deterministic per case+action-type - a retry of the SAME case's
-    SAME action always reuses this key, so a retried execution attempt
-    never double-executes, per Layer 5."""
-    return f"{case_id}:{action.value}"
+def _derive_idempotency_key(case_id: str, action: ResolutionAction, payment_intent_id: str = None,
+                             order_id: str = None, amount_usd: float = None) -> str:
+    """Deterministic per case+action+underlying-request-parameters — a
+    genuine RETRY of the SAME operation (same case, same action, same
+    payment_intent_id/order_id/amount) always reuses this key, so it
+    never double-executes, per Layer 5. Retrying with the exact same
+    parameters is the only thing this key represents "the same
+    request" for.
+
+    Found and fixed a real gap here: this previously derived the key
+    from case_id+action ALONE, with zero awareness of the underlying
+    payment_intent_id or amount. A genuinely NEW operation for the same
+    case (e.g. re-processing a case against a freshly created payment,
+    which is exactly what happens when a demo script creates a new
+    Stripe test payment each run but reuses the same case_id) collided
+    with the OLD key's already-used Stripe idempotency state — Stripe
+    correctly rejected it with "Keys for idempotent requests can only
+    be used with the same parameters they were first used with,"
+    since from Stripe's perspective, the same key WAS reused for a
+    genuinely different request. Incorporating the actual resource
+    identifiers into the key means a genuinely different underlying
+    request naturally gets a different key, while a true retry of the
+    identical request still correctly reuses the same one.
+    """
+    parts = [case_id, action.value]
+    if payment_intent_id:
+        parts.append(payment_intent_id)
+    if order_id:
+        parts.append(order_id)
+    if amount_usd is not None:
+        parts.append(f"{amount_usd:.2f}")
+    return ":".join(parts)
 
 
 def execute_resolution(
@@ -59,12 +86,40 @@ def execute_resolution(
     attempt succeeding at the HTTP-call level alone - the underlying tool
     already enforces idempotency, so this function's retry loop is safe
     to retry blindly on transient failures."""
-    idempotency_key = _derive_idempotency_key(case_id, decision.action)
+    idempotency_key = _derive_idempotency_key(
+        case_id, decision.action, payment_intent_id=payment_intent_id,
+        order_id=order_id, amount_usd=decision.amount_usd,
+    )
 
     if decision.action == ResolutionAction.DENY:
         return ExecutionResult(status=ExecutionStatus.NO_ACTION_NEEDED, idempotency_key=idempotency_key)
 
     if decision.action in (ResolutionAction.REFUND, ResolutionAction.PARTIAL_CREDIT):
+        if not payment_intent_id:
+            # Fail immediately and clearly, rather than attempting a
+            # call that can NEVER succeed. Found from a real production
+            # run: a case with no payment_intent_id at all (a real Groq
+            # LLM diagnosed "payment_issue: missing payment information"
+            # from the ABSENCE of a payment record, unlike
+            # FakeLLMClient's deterministic planner, which only ever
+            # reaches this root cause when an actual declined
+            # transaction exists) still routed to REFUND — and
+            # execute_resolution wasted 3 real retries against Stripe,
+            # each failing identically with "One of the following
+            # params should be provided for this request: payment_intent
+            # or charge," since there was never a payment_intent_id to
+            # refund in the first place. A missing precondition is a
+            # deterministic failure, not a transient one — retrying it
+            # is pure waste, and the real error is buried under three
+            # copies of the same unhelpful Stripe message instead of one
+            # clear one.
+            return ExecutionResult(
+                status=ExecutionStatus.PENDING_RETRY, idempotency_key=idempotency_key, attempts_made=0,
+                error=f"Cannot execute {decision.action.value} - no payment_intent_id is associated "
+                      f"with this case. A refund requires a real payment to refund against; this "
+                      f"case has none on record, which is itself worth investigating rather than "
+                      f"retried blindly.",
+            )
         breaker = get_circuit_breaker("payment", failure_threshold=3, reset_timeout_seconds=30.0)
         gateway = payment_tool.get_payment_gateway()
 

@@ -179,3 +179,28 @@ def test_backend_status_flags_easypost_priority_when_both_carrier_keys_set(monke
         assert data["carrier"]["note"] is not None
 
     get_settings.cache_clear()
+
+
+def test_list_alerts_returns_real_recorded_alerts():
+    """THE regression test for a real gap found directly: AlertRecord
+    entries (circuit breaker trips, log_episode failures, etc.) were
+    only ever queryable via a Python function called directly against
+    the database — no API endpoint exposed them at all."""
+    from app.core.db import SessionLocal
+    from app.core.alerting import send_alert
+
+    db = SessionLocal()
+    send_alert(db, "log_episode_failure", {"case_id": "case-alert-endpoint-test", "error": "test"})
+    db.close()
+
+    from app.main import app
+    from fastapi.testclient import TestClient
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/admin/alerts")
+        assert resp.status_code == 200
+        alerts = resp.json()
+        assert any(a["detail"].get("case_id") == "case-alert-endpoint-test" for a in alerts)
+
+        resp2 = client.get("/api/v1/admin/alerts?event_type=log_episode_failure")
+        assert resp2.status_code == 200
+        assert all(a["event_type"] == "log_episode_failure" for a in resp2.json())

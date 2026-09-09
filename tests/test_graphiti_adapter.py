@@ -148,6 +148,47 @@ def test_graphiti_client_uses_groq_llm_config(monkeypatch):
     ga._get_graphiti_client()
     llm_client = captured["llm_client"]
     assert llm_client.config.api_key == "gsk_fake_test_key_xyz"
+
+
+def test_graphiti_uses_a_dedicated_model_with_json_schema_mode(monkeypatch):
+    """THE regression test for a real production bug found from an
+    actual Neo4j write: a Pydantic validation error ("Field required:
+    summaries") on Graphiti's own internal SummarizedEntities schema,
+    traced to json_object mode only guaranteeing valid JSON, not that
+    it matches Graphiti's exact expected shape.
+
+    graphiti_router_model started as moonshotai/kimi-k2-instruct-0905
+    (a model Groq documented as reliably supporting json_schema), but a
+    real run against real Groq returned a 404 "model does not exist" —
+    confirmed directly against Groq's own deprecation announcements:
+    retired March 23, 2026 in favor of openai/gpt-oss-120b, alongside
+    most other alternatives (Kimi K2, Llama 4 Maverick, Llama Guard 4,
+    Qwen3-32B, Llama 4 Scout), all deprecated in favor of the same
+    model. gpt-oss-120b is now the realistic, actively-maintained
+    choice — this proves the dedicated setting and the stronger
+    json_schema mode are genuinely wired in; whether this specific
+    model enforces the schema reliably in practice is what the real
+    log_episode_failure alerting (app/core/alerting.py) exists to
+    surface, not something assumed here."""
+    os.environ["GROQ_API_KEY"] = "gsk_fake_test_key_xyz"
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    import app.memory.graphiti_adapter as ga
+    ga.reset_graphiti_client()
+
+    captured = {}
+
+    class FakeGraphiti:
+        def __init__(self, llm_client, embedder, graph_driver, cross_encoder=None):
+            captured["llm_client"] = llm_client
+
+    monkeypatch.setattr("graphiti_core.Graphiti", FakeGraphiti)
+
+    ga._get_graphiti_client()
+    llm_client = captured["llm_client"]
+    assert llm_client.config.model == "openai/gpt-oss-120b"
+    assert llm_client.structured_output_mode == "json_schema"
     assert llm_client.config.base_url == "https://api.groq.com/openai/v1"
 
 def test_embedder_adapter_bridges_to_real_tfidf_embedder():

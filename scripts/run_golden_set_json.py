@@ -43,6 +43,43 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from app.core.config import Settings
 Settings.model_config["env_file"] = None
 
+# THIRD, more direct layer of protection, added after the above two
+# still weren't enough in a real, reported case (a real Windows
+# environment where a golden-set run somehow still selected a real
+# StripeGateway, crashing an unrelated scenario that called a
+# fake-only method). Rather than keep reasoning about WHY inherited
+# env vars or .env file reading might still leak through on some
+# specific OS/environment combination this hasn't been tested against,
+# this forcibly clears every cloud-credential field on the constructed
+# Settings object directly, regardless of what path it might otherwise
+# have been populated from — a "trust nothing, verify directly"
+# guarantee rather than one more assumption about mechanism.
+import app.core.config as config_module
+_original_cached_get_settings = config_module.get_settings  # the lru_cache-wrapped function itself
+_original_get_settings = _original_cached_get_settings.__wrapped__
+
+
+def _isolated_get_settings():
+    settings = _original_cached_get_settings()
+    for field in ("stripe_api_key", "easypost_api_key", "shippo_api_key",
+                  "groq_api_key", "mistral_api_key", "qdrant_url", "qdrant_api_key",
+                  "neo4j_uri", "neo4j_password", "redis_url",
+                  "langfuse_public_key", "langfuse_secret_key", "tracing_enabled"):
+        if hasattr(settings, field):
+            object.__setattr__(settings, field, None if field != "tracing_enabled" else False)
+    return settings
+
+
+# Preserve .cache_clear() — other code (including golden_set.py's own
+# scenarios) calls get_settings.cache_clear() expecting the normal
+# lru_cache interface. Found directly: replacing get_settings with a
+# plain function that lacks this method broke a DIFFERENT scenario
+# with "'function' object has no attribute 'cache_clear'" the moment
+# this fix's first version ran for real.
+_isolated_get_settings.cache_clear = _original_cached_get_settings.cache_clear
+
+config_module.get_settings = _isolated_get_settings
+
 from tests.golden_set import ALL_SCENARIOS
 
 

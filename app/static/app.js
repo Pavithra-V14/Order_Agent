@@ -34,26 +34,56 @@ function toast(msg, isError) {
 
 async function initDashboard() {
   const tbody = document.getElementById('cases-tbody');
+  const typeSelect = document.getElementById('filter-exception-type');
+  const stateSelect = document.getElementById('filter-state');
+
+  // Populate the type dropdown from what's ACTUALLY in the database,
+  // not a hardcoded list — found necessary directly: the API schema
+  // documents payment/inventory/carrier/return/fraud as valid values,
+  // but not every one of those has ever been assigned by real code,
+  // so a hardcoded dropdown would offer options that always return
+  // zero results.
   try {
-    const cases = await apiGet('/api/v1/cases');
-    if (!cases.length) {
-      tbody.closest('table').outerHTML = '<div class="empty-state">No cases yet. Trigger a webhook (POST /api/v1/webhooks/oms) to create one.</div>';
-      return;
+    const types = await apiGet('/api/v1/cases/meta/exception-types');
+    types.forEach(function (t) {
+      const opt = document.createElement('option');
+      opt.value = t;
+      opt.textContent = t;
+      typeSelect.appendChild(opt);
+    });
+  } catch (e) { /* non-fatal — filter still works with just "All" */ }
+
+  async function render() {
+    tbody.innerHTML = '<tr><td colspan="7"><div class="empty-state">Loading...</div></td></tr>';
+    try {
+      const params = new URLSearchParams();
+      if (typeSelect.value) params.set('exception_type', typeSelect.value);
+      if (stateSelect.value) params.set('state', stateSelect.value);
+      const query = params.toString();
+      const cases = await apiGet('/api/v1/cases' + (query ? '?' + query : ''));
+      if (!cases.length) {
+        tbody.innerHTML = '<tr><td colspan="7"><div class="empty-state">No cases match this filter.</div></td></tr>';
+        return;
+      }
+      tbody.innerHTML = cases.map(function (c) {
+        return '<tr>' +
+          '<td><a class="id" href="/cases/' + esc(c.id) + '">' + esc(c.id.slice(0, 8)) + '</a></td>' +
+          '<td class="id">' + esc(c.order_id) + '</td>' +
+          '<td class="id">' + esc(c.customer_id) + '</td>' +
+          '<td>' + esc(c.exception_type) + '</td>' +
+          '<td>' + badge(c.state, c.state) + '</td>' +
+          '<td>' + (c.fraud_flag ? badge('flagged', 'flagged') : '\u2014') + '</td>' +
+          '<td>' + fmtDate(c.created_at) + '</td>' +
+          '</tr>';
+      }).join('');
+    } catch (e) {
+      tbody.innerHTML = '<tr><td colspan="7"><div class="empty-state">Error loading cases: ' + esc(e.message) + '</div></td></tr>';
     }
-    tbody.innerHTML = cases.map(function (c) {
-      return '<tr>' +
-        '<td><a class="id" href="/cases/' + esc(c.id) + '">' + esc(c.id.slice(0, 8)) + '</a></td>' +
-        '<td class="id">' + esc(c.order_id) + '</td>' +
-        '<td class="id">' + esc(c.customer_id) + '</td>' +
-        '<td>' + esc(c.exception_type) + '</td>' +
-        '<td>' + badge(c.state, c.state) + '</td>' +
-        '<td>' + (c.fraud_flag ? badge('flagged', 'flagged') : '\u2014') + '</td>' +
-        '<td>' + fmtDate(c.created_at) + '</td>' +
-        '</tr>';
-    }).join('');
-  } catch (e) {
-    tbody.closest('table').outerHTML = '<div class="empty-state">Error loading cases: ' + esc(e.message) + '</div>';
   }
+
+  typeSelect.addEventListener('change', render);
+  stateSelect.addEventListener('change', render);
+  await render();
 }
 
 async function initCaseDetail() {
