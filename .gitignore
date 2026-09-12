@@ -13,3 +13,9 @@ v1/
 .coverage
 qdrant_local_test_phase11\
 cmd.txt
+app/__pycache__/
+tests/__pycache__/
+.coverage
+data/qdrant_local/
+data/kuzu_local/
+dump.rdb
