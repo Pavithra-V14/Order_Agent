@@ -1,21 +1,54 @@
+# =========================
+# Environment / secrets
+# =========================
 .env
-.venv
-.pytest_cache
-.pytest_cache/
-__pycache__
+!.env.example
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+
+# =========================
+# Python cache
+# =========================
 __pycache__/
-*.pyc
-qdrant_local/
-.cpython-312.pyc
-v1/
-.deepeval
-.env
+*.py[cod]
+*$py.class
+
+# =========================
+# Pytest / coverage
+# =========================
+.pytest_cache/
 .coverage
-qdrant_local_test_phase11\
-cmd.txt
-app/__pycache__/
-tests/__pycache__/
-.coverage
+.coverage.*
+htmlcov/
+
+# =========================
+# Qdrant / local vector DB
+# =========================
 data/qdrant_local/
+data/qdrant_local_test_phase11/
+
+# =========================
+# Kùzu local database
+# =========================
 data/kuzu_local/
+
+# =========================
+# Redis local database dump
+# =========================
 dump.rdb
+
+# =========================
+# DeepEval local files
+# =========================
+.deepeval/
+
+# =========================
+# Temporary files
+# =========================
+cmd.txt
+*.tmp
+*.log
