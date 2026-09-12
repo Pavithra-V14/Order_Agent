@@ -1,0 +1,39 @@
+[project]
+name = "order-exception-agent"
+version = "1.0.0"
+description = "Autonomous omnichannel order exception and fulfillment resolution agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+# Dependencies are pinned in requirements.txt, which remains the
+# source of truth for installation (pip install -r requirements.txt) -
+# this file exists for tooling that expects project metadata to live
+# in pyproject.toml (linters, IDEs, packaging tools), not to duplicate
+# or replace requirements.txt.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+# "auto" mode makes pytest-asyncio run any bare `async def test_*`
+# function automatically, without needing an explicit
+# @pytest.mark.asyncio marker on each one. Added specifically because a
+# real user's environment showed an unmarked async test (test_async, in
+# a diagnostic-only Neo4j connectivity script, not part of this
+# project's own test suite) failing with "async def functions are not
+# natively supported" under STRICT mode - auto mode is the standard fix
+# for exactly this, and is more permissive than this project's own
+# tests need (none of which rely on bare unmarked async tests), so it
+# costs nothing to enable.
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/tools/mcp_server.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]

@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Case Queue{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Case Queue</h1>
+  <p>All order exception cases, most recent first.</p>
+</div>
+<div style="display:flex; gap:12px; margin-bottom:16px; align-items:center;">
+  <label style="font-size:13px; color:var(--text-secondary);">Type:
+    <select id="filter-exception-type" style="margin-left:6px;">
+      <option value="">All</option>
+    </select>
+  </label>
+  <label style="font-size:13px; color:var(--text-secondary);">State:
+    <select id="filter-state" style="margin-left:6px;">
+      <option value="">All</option>
+      <option value="detected">detected</option>
+      <option value="diagnosing">diagnosing</option>
+      <option value="decided">decided</option>
+      <option value="escalated">escalated</option>
+      <option value="executing">executing</option>
+      <option value="verifying">verifying</option>
+      <option value="resolved">resolved</option>
+      <option value="reopened">reopened</option>
+    </select>
+  </label>
+</div>
+<table>
+  <thead>
+    <tr><th>Case</th><th>Order</th><th>Customer</th><th>Type</th><th>State</th><th>Fraud</th><th>Created</th></tr>
+  </thead>
+  <tbody id="cases-tbody">
+    <tr><td colspan="7"><div class="empty-state">Loading...</div></td></tr>
+  </tbody>
+</table>
+{% endblock %}

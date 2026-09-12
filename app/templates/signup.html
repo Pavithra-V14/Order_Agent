@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign Up — Order Exception Agent</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/style.css">
+  <style>
+    body { display: flex; align-items: center; justify-content: center; min-height: 100vh; background: var(--bg); }
+    .auth-card {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+      padding: 32px; width: 380px; box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    }
+    .auth-logo { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; margin-bottom: 4px; color: var(--text); }
+    .auth-logo span { color: var(--accent); }
+    .auth-subtitle { color: var(--text-secondary); font-size: 13px; margin-bottom: 24px; }
+    .auth-field { margin-bottom: 14px; }
+    .auth-field label { display: block; font-size: 12.5px; color: var(--text-secondary); margin-bottom: 4px; }
+    .auth-field input, .auth-field select { width: 100%; }
+    .auth-field .hint { font-size: 11px; color: var(--text-faint); margin-top: 3px; }
+    .auth-submit { width: 100%; margin-top: 8px; }
+    .auth-error {
+      background: #FBEAEA; border: 1px solid var(--state-blocked); color: var(--state-blocked);
+      border-radius: var(--radius); padding: 8px 10px; font-size: 12.5px; margin-bottom: 14px; display: none;
+    }
+    .auth-footer { margin-top: 18px; text-align: center; font-size: 12.5px; color: var(--text-secondary); }
+  </style>
+</head>
+<body>
+  <div class="auth-card">
+    <div class="auth-logo">
+      <svg width="22" height="22" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M16 2L28 8V17C28 24 22.5 29 16 30C9.5 29 4 24 4 17V8L16 2Z" fill="var(--accent)" fill-opacity="0.16" stroke="var(--accent)" stroke-width="1.6"/>
+        <path d="M11 16.5L14.5 20L21.5 12" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      Order Exception<span>Agent</span>
+    </div>
+    <div class="auth-subtitle">Create an account</div>
+    <div class="auth-error" id="auth-error"></div>
+    <form id="signup-form">
+      <div class="auth-field">
+        <label for="name">Full name</label>
+        <input type="text" id="name" required autocomplete="name">
+      </div>
+      <div class="auth-field">
+        <label for="email">Email</label>
+        <input type="email" id="email" required autocomplete="email">
+      </div>
+      <div class="auth-field">
+        <label for="password">Password</label>
+        <input type="password" id="password" required autocomplete="new-password" minlength="8">
+        <div class="hint">At least 8 characters.</div>
+      </div>
+      <div class="auth-field">
+        <label for="role">Role</label>
+        <select id="role">
+          <option value="cs_agent">CS Agent — can review and approve escalations</option>
+          <option value="readonly">Read-only — can view cases, metrics, and audit log</option>
+        </select>
+        <div class="hint">Admin and service accounts are issued separately, not through self-service signup.</div>
+      </div>
+      <button type="submit" class="primary auth-submit" id="submit-btn">Sign Up</button>
+    </form>
+    <div class="auth-footer">
+      Already have an account? <a href="/login">Sign in</a>
+    </div>
+  </div>
+
+  <script>
+    document.getElementById('signup-form').addEventListener('submit', async function (e) {
+      e.preventDefault();
+      const errorEl = document.getElementById('auth-error');
+      const submitBtn = document.getElementById('submit-btn');
+      errorEl.style.display = 'none';
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Signing up...';
+
+      try {
+        const resp = await fetch('/api/v1/auth/signup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: document.getElementById('name').value,
+            email: document.getElementById('email').value,
+            password: document.getElementById('password').value,
+            role: document.getElementById('role').value,
+          }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          const detail = data.detail;
+          const message = Array.isArray(detail) ? detail.map(function (d) { return d.msg; }).join(', ') : detail;
+          throw new Error(message || 'Sign up failed');
+        }
+        localStorage.setItem('oea_jwt', data.access_token);
+        localStorage.setItem('oea_user_name', data.name);
+        localStorage.setItem('oea_user_role', data.role);
+        window.location.href = '/';
+      } catch (err) {
+        errorEl.textContent = err.message;
+        errorEl.style.display = 'block';
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Sign Up';
+      }
+    });
+  </script>
+</body>
+</html>

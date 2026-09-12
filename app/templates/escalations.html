@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Escalations{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Escalation Queue</h1>
+  <p>Cases awaiting human review, priority-sorted (fraud-flagged and higher-value cases first).</p>
+</div>
+<table>
+  <thead>
+    <tr><th>Case</th><th>Order</th><th>Type</th><th>Fraud</th><th>Proposed resolution</th><th>Priority</th><th>Action</th></tr>
+  </thead>
+  <tbody id="escalations-tbody">
+    <tr><td colspan="7"><div class="empty-state">Loading...</div></td></tr>
+  </tbody>
+</table>
+<div id="escalations-empty" class="empty-state" style="display:none;">No cases awaiting escalation review.</div>
+{% endblock %}

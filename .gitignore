@@ -1,0 +1,15 @@
+.env
+.venv
+.pytest_cache
+.pytest_cache/
+__pycache__
+__pycache__/
+*.pyc
+qdrant_local/
+.cpython-312.pyc
+v1/
+.deepeval
+.env
+.coverage
+qdrant_local_test_phase11\
+cmd.txt

@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}Admin{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Admin — Data Management</h1>
+  <p>Development/testing reset tools. These delete real data with no undo — used mainly to reset the system to a clean state between test runs.</p>
+</div>
+
+<div class="panel" style="max-width:640px; margin-bottom:16px;">
+  <h2>Recent Alerts</h2>
+  <p class="rationale-text">Circuit breaker trips, idempotency collisions, Tier 1 blocks, and memory-write failures.</p>
+  <button id="btn-check-alerts">Check Recent Alerts</button>
+  <div id="alerts-result" style="margin-top:12px;"></div>
+</div>
+
+<div class="panel" style="max-width:640px; margin-bottom:16px;">
+  <h2>Backend Status</h2>
+  <p class="rationale-text">Which real implementation is active for each swappable component, right now, based on your actual configuration.</p>
+  <button id="btn-check-backend-status">Check Backend Status</button>
+  <div id="backend-status-result" style="margin-top:12px;"></div>
+</div>
+
+<div class="panel" style="max-width:640px; margin-bottom:16px;">
+  <h2>Delete Audit Log</h2>
+  <p class="rationale-text">Deletes every audit log entry only. Cases, orders, and everything else stay untouched.</p>
+  <button id="btn-delete-audit" class="danger">Delete Audit Log</button>
+  <div id="result-audit" class="rationale-text" style="margin-top:8px;"></div>
+</div>
+
+<div class="panel" style="max-width:640px; margin-bottom:16px;">
+  <h2>Delete RAG Index</h2>
+  <p class="rationale-text">Deletes the Qdrant collection (policy embeddings) and clears the local reindex-state tracker. Run scripts/run_ingestion.py afterward to rebuild it from scratch.</p>
+  <button id="btn-delete-rag" class="danger">Delete RAG Index</button>
+  <div id="result-rag" class="rationale-text" style="margin-top:8px;"></div>
+</div>
+
+<div class="panel" style="max-width:640px; margin-bottom:16px; border-color:#c0392b;">
+  <h2>Delete ALL Data (Postgres/SQLite)</h2>
+  <p class="rationale-text"><strong>Every case, order, stock record, audit entry, trace span, learning-loop pattern, and threshold override — gone.</strong> Does not touch the RAG index or the long-term memory graph (Neo4j/Kuzu) — those have their own separate reset above / are external systems.</p>
+  <button id="btn-delete-all" class="danger">Delete ALL Data</button>
+  <div id="result-all" class="rationale-text" style="margin-top:8px;"></div>
+</div>
+
+<script>
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+}); }
+
+document.getElementById('btn-check-alerts').addEventListener('click', async function () {
+  const resultEl = document.getElementById('alerts-result');
+  resultEl.innerHTML = '<div class="rationale-text">Checking...</div>';
+  const resp = await fetch('/api/v1/admin/alerts');
+  const alerts = await resp.json();
+  if (!alerts.length) {
+    resultEl.innerHTML = '<div class="empty-state">No alerts recorded.</div>';
+    return;
+  }
+  const rows = alerts.map(function (a) {
+    const badgeCls = a.event_type === 'log_episode_failure' ? 'escalated' : 'blocked';
+    return '<tr><td>' + esc(new Date(a.created_at).toLocaleString()) + '</td>' +
+           '<td>' + badge(a.event_type, badgeCls) + '</td>' +
+           '<td class="rationale-text">' + esc(JSON.stringify(a.detail)) + '</td></tr>';
+  }).join('');
+  resultEl.innerHTML = '<table><thead><tr><th>When</th><th>Type</th><th>Detail</th></tr></thead><tbody>' + rows + '</tbody></table>';
+});
+
+document.getElementById('btn-check-backend-status').addEventListener('click', async function () {
+  const resultEl = document.getElementById('backend-status-result');
+  resultEl.innerHTML = '<div class="rationale-text">Checking...</div>';
+  const resp = await fetch('/api/v1/admin/backend-status');
+  const data = await resp.json();
+  const rows = Object.entries(data).map(function (kv) {
+    const name = kv[0].replace(/_/g, ' ');
+    const info = kv[1];
+    const isReal = info.active.includes('(real)');
+    const badgeCls = isReal ? 'resolved' : 'diagnosing';
+    let extra = '';
+    if (info.note) extra += '<div class="rationale-text">' + esc(info.note) + '</div>';
+    if (info.model) extra += '<div class="rationale-text">model: ' + esc(info.model) + '</div>';
+    if (info.url) extra += '<div class="rationale-text">' + esc(info.url) + '</div>';
+    return '<tr><td>' + esc(name) + '</td><td><span class="badge ' + badgeCls + '">' + esc(info.active) + '</span>' + extra + '</td></tr>';
+  }).join('');
+  resultEl.innerHTML = '<table><thead><tr><th>Component</th><th>Active</th></tr></thead><tbody>' + rows + '</tbody></table>';
+});
+function confirmAndDelete(url, resultElId, label) {
+  if (!confirm('Are you sure? This deletes ' + label + ' with no undo.')) return;
+  fetch(url + '?confirm=true', { method: 'DELETE' })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      document.getElementById(resultElId).textContent = JSON.stringify(data, null, 2);
+    })
+    .catch(function (err) {
+      document.getElementById(resultElId).textContent = 'Error: ' + err;
+    });
+}
+
+document.getElementById('btn-delete-audit').addEventListener('click', function () {
+  confirmAndDelete('/api/v1/admin/audit-log', 'result-audit', 'the entire audit log');
+});
+document.getElementById('btn-delete-rag').addEventListener('click', function () {
+  confirmAndDelete('/api/v1/admin/rag-index', 'result-rag', 'the RAG index');
+});
+document.getElementById('btn-delete-all').addEventListener('click', function () {
+  confirmAndDelete('/api/v1/admin/all-data', 'result-all', 'ALL application data');
+});
+</script>
+{% endblock %}

@@ -1,0 +1,17 @@
+{
+  "established_at": "2026-09-12T05:15:25.733385+00:00",
+  "pass_count": 10,
+  "total": 10,
+  "scenario_results": {
+    "temporal_policy_correctness": true,
+    "duplicate_refund_idempotency": true,
+    "fraud_vs_high_ltv_customer": true,
+    "multi_cause_diagnosis": true,
+    "runaway_loop_terminates": true,
+    "tier1_hard_block": true,
+    "circuit_breaker_fails_fast": true,
+    "webhook_cache_invalidation": true,
+    "idempotency_key_reuse_with_different_args_raises": true,
+    "pii_redacted_before_trace_persist": true
+  }
+}

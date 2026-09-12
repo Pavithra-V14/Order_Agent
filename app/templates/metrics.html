@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Metrics{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Live Metrics</h1>
+  <p>Computed from real trace and audit data as the system actually runs — not the golden-set regression check (see the Testing page for that, kept separate so the two are never confused).</p>
+</div>
+<div class="tabs">
+  <div class="tab active" data-scope="agent">Agent</div>
+  <div class="tab" data-scope="tool">Tool</div>
+  <div class="tab" data-scope="rag">RAG</div>
+  <div class="tab" data-scope="system">System</div>
+</div>
+<div id="metrics-root"><div class="empty-state">Loading...</div></div>
+{% endblock %}
