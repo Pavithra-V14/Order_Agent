@@ -26,8 +26,24 @@ from app.tools import payment as payment_tool, wms as wms_tool, carrier as carri
 
 class ExecutionStatus(str, Enum):
     EXECUTED = "executed"
-    PENDING_RETRY = "pending_retry"
+    PENDING_RETRY = "pending_retry"      # transient: dependency down / timed out - safe to retry later
+    FAILED = "failed"                    # permanent: retrying the same request can never succeed
     NO_ACTION_NEEDED = "no_action_needed"
+
+
+# Exception class NAMES (so the fake gateway path needs no stripe import)
+# that describe the REQUEST, not the dependency's health: retrying them is
+# waste, and counting them against the circuit breaker lets one bad
+# request block every other customer (observed against real Stripe: an
+# "already been refunded" error, retried 3x, opened the payment circuit).
+_PERMANENT_ERROR_NAMES = frozenset({
+    "InvalidRequestError", "CardError", "AuthenticationError", "PermissionError",
+    "IdempotencyError", "IdempotencyKeyReusedWithDifferentArgs", "ValueError", "KeyError",
+})
+
+
+def _is_transient(e: Exception) -> bool:
+    return type(e).__name__ not in _PERMANENT_ERROR_NAMES
 
 
 @dataclass
@@ -63,11 +79,18 @@ def _derive_idempotency_key(case_id: str, action: ResolutionAction, payment_inte
     request naturally gets a different key, while a true retry of the
     identical request still correctly reuses the same one.
     """
-    parts = [case_id, action.value]
+    # case_id is deliberately NOT part of the key when the underlying
+    # resource is known: two cases opened for the same order (a duplicate
+    # webhook delivery) must collapse to ONE refund, not two. Confirmed
+    # against real Stripe test mode: two 50% partial credits on one
+    # payment both succeeded under case-scoped keys.
+    parts = [action.value]
     if payment_intent_id:
         parts.append(payment_intent_id)
     if order_id:
         parts.append(order_id)
+    if not payment_intent_id and not order_id:
+        parts.insert(0, case_id)
     if amount_usd is not None:
         parts.append(f"{amount_usd:.2f}")
     return ":".join(parts)
@@ -114,7 +137,7 @@ def execute_resolution(
             # copies of the same unhelpful Stripe message instead of one
             # clear one.
             return ExecutionResult(
-                status=ExecutionStatus.PENDING_RETRY, idempotency_key=idempotency_key, attempts_made=0,
+                status=ExecutionStatus.FAILED, idempotency_key=idempotency_key, attempts_made=0,
                 error=f"Cannot execute {decision.action.value} - no payment_intent_id is associated "
                       f"with this case. A refund requires a real payment to refund against; this "
                       f"case has none on record, which is itself worth investigating rather than "
@@ -131,7 +154,7 @@ def execute_resolution(
                 result = breaker.call(lambda: record_tool_call(
                     db, case_id, "payment.issue_refund", True, gateway.issue_refund,
                     db, payment_intent_id, decision.amount_usd, idempotency_key,
-                ))
+                ), is_failure=_is_transient)
                 return ExecutionResult(status=ExecutionStatus.EXECUTED, result=result,
                                         idempotency_key=idempotency_key, attempts_made=attempts)
             except CircuitOpenError as e:
@@ -143,8 +166,11 @@ def execute_resolution(
                                         attempts_made=attempts, error=str(e))
             except Exception as e:
                 last_error = str(e)
+                if not _is_transient(e):
+                    return ExecutionResult(status=ExecutionStatus.FAILED, idempotency_key=idempotency_key,
+                                            attempts_made=attempts, error=last_error)
                 if attempt < max_retries:
-                    time.sleep(retry_backoff_seconds)
+                    time.sleep(retry_backoff_seconds * (2 ** (attempt - 1)))
                 continue
 
         return ExecutionResult(status=ExecutionStatus.PENDING_RETRY, idempotency_key=idempotency_key,
@@ -157,7 +183,7 @@ def execute_resolution(
             result = breaker.call(lambda: record_tool_call(
                 db, case_id, "carrier.generate_return_label", True,
                 gateway.generate_return_label, db, order_id, idempotency_key,
-            ))
+            ), is_failure=_is_transient)
             return ExecutionResult(status=ExecutionStatus.EXECUTED, result=result,
                                     idempotency_key=idempotency_key, attempts_made=1)
         except CircuitOpenError as e:
@@ -166,7 +192,8 @@ def execute_resolution(
             return ExecutionResult(status=ExecutionStatus.PENDING_RETRY, idempotency_key=idempotency_key,
                                     attempts_made=1, error=str(e))
         except Exception as e:
-            return ExecutionResult(status=ExecutionStatus.PENDING_RETRY, idempotency_key=idempotency_key,
+            status = ExecutionStatus.PENDING_RETRY if _is_transient(e) else ExecutionStatus.FAILED
+            return ExecutionResult(status=status, idempotency_key=idempotency_key,
                                     attempts_made=1, error=str(e))
 
     return ExecutionResult(status=ExecutionStatus.NO_ACTION_NEEDED, idempotency_key=idempotency_key)

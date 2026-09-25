@@ -30,12 +30,28 @@ class VerificationResult:
     detail: str = ""
 
 
-def verify_refund(db: Session, idempotency_key: str) -> VerificationResult:
+def verify_refund(db: Session, idempotency_key: str, refund_id: str | None = None) -> VerificationResult:
     """Independent check: does a completed idempotency record for this
     EXACT key exist with a 'succeeded' result? This is deliberately NOT
     just re-reading the Execution Agent's in-memory return value - it
-    re-derives the answer from the durable record."""
+    re-derives the answer from the durable record.
+
+    The real Stripe gateway relies on Stripe's own idempotency and writes
+    no local record, so when there is none and a refund_id is known, the
+    refund is re-fetched from the provider instead."""
     record = db.get(IdempotencyRecord, idempotency_key)
+    if record is None and refund_id:
+        from app.tools.payment import get_payment_gateway
+        refund = get_payment_gateway().get_refund(refund_id)
+        if refund is not None:
+            if refund["status"] == "succeeded":
+                return VerificationResult(status=VerificationStatus.VERIFIED,
+                                           detail=f"Refund {refund_id} confirmed by the payment provider.")
+            if refund["status"] in ("pending", "requires_action"):
+                return VerificationResult(status=VerificationStatus.NOT_YET_VERIFIABLE,
+                                           detail=f"Refund {refund_id} is {refund['status']} at the provider.")
+            return VerificationResult(status=VerificationStatus.VERIFICATION_FAILED,
+                                       detail=f"Provider reports refund {refund_id} as {refund['status']!r}.")
     if record is None:
         return VerificationResult(status=VerificationStatus.VERIFICATION_FAILED,
                                    detail=f"No idempotency record found for key {idempotency_key!r} - "

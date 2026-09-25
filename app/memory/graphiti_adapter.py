@@ -348,18 +348,45 @@ async def _wait_for_neo4j_driver_init(client) -> None:
 
 
 async def _add_episode_async(customer_id: str, episode_type: str, content: dict,
-                              occurred_at: datetime, case_id: str = None) -> None:
+                              occurred_at: datetime, case_id: str = None,
+                              group_id_override: str = None) -> None:
+    """group_id_override (default None -> uses customer_id, the existing,
+    unchanged per-customer isolation): lets a caller deliberately opt an
+    episode INTO a shared group_id instead - see
+    log_cross_customer_signal() below for why this exists and what it's
+    for. Every other caller in this codebase passes no override and
+    sees identical behavior to before."""
     client = _build_graphiti_client()
     try:
+        # NOT calling client.build_indices_and_constraints() here -
+        # found, by reading Neo4jDriver.__init__'s actual source, to be
+        # pure redundancy causing a real, confirmed problem: the driver
+        # ALREADY schedules this exact operation (31 separate index/
+        # constraint queries, fired concurrently) as a background task
+        # on construction (self._init_task, see
+        # _wait_for_neo4j_driver_init's own docstring for the race this
+        # project already found and fixed around that task). Since a
+        # FRESH driver is built on every single call here, an explicit
+        # second call meant this project was firing 62 index queries
+        # against Neo4j on every single log_episode() - not 31 - which
+        # is exactly the kind of load that can push a real 30s timeout
+        # on a free-tier Aura instance from "usually fine" to "fails
+        # under real use," and a strong candidate for the
+        # 'Neo4jDriver._execute_index_query was never awaited' warning
+        # observed in practice (two concurrent full index-build runs
+        # racing on the same connection pool). _wait_for_neo4j_driver_
+        # init already awaits the ONE the driver does on its own -
+        # that's sufficient, and matches Graphiti's own documented
+        # intent (build_indices_and_constraints' docstring: "should
+        # typically be called once during initial setup," not per-call).
         await _wait_for_neo4j_driver_init(client)
-        await client.build_indices_and_constraints()
         episode_body = json.dumps({"episode_type": episode_type, "content": content, "case_id": case_id})
         await client.add_episode(
             name=episode_type,
             episode_body=episode_body,
             source_description=f"case:{case_id}" if case_id else "system",
             reference_time=occurred_at,
-            group_id=customer_id,
+            group_id=group_id_override or customer_id,
         )
     finally:
         await client.close()
@@ -393,6 +420,128 @@ async def _get_customer_history_async(customer_id: str, episode_type: str = None
     return results
 
 
+# --- Genuine Graphiti-native cross-customer relations -----------------------
+#
+# The question this answers: "does Graphiti's OWN extraction pipeline
+# have relations across customers now?" Answer, stated precisely: not
+# through the normal per-customer episode path (group_id=customer_id
+# still isolates every customer's graph from every other's, by design -
+# unchanged, and unfixable without abandoning that isolation entirely).
+# What's added here is a SEPARATE, PARALLEL, opt-in path: episodes about
+# a cross-customer SIGNAL (e.g. a payment fingerprint) are logged under
+# one SHARED group_id instead of the customer's own - and Graphiti's
+# dedup (see find_related_fraud_signals's docstring for how it was
+# verified to scope by group_id) then operates WITHIN that one shared
+# space, so it genuinely CAN merge/relate entities extracted from
+# different customers' signal mentions there. This is real, not a
+# rename of the Stage 1 deterministic query - the two are complementary,
+# not the same mechanism, and are kept clearly separate below.
+#
+# WHY THIS DOESN'T REPLACE find_related_fraud_signals() AS THE
+# AUTHORITATIVE FRAUD CHECK: relying on an LLM to correctly and
+# consistently extract "this is the same payment method" as one
+# identically-named entity across separately-written episodes is
+# inherently non-deterministic - exactly the reason Stage 1 avoided it
+# for the fraud decision itself. So this graph is populated as a real,
+# genuine best-effort signal for human/audit exploration (surfaced
+# alongside a case, not silently folded into an automated risk score),
+# while the exact-match Cypher query remains the one thing the fraud
+# agent's automated decision actually depends on. Tier 1's own
+# "guardrails can't be gamed by fuzzy LLM output" principle applies
+# here too: a non-deterministic relationship shouldn't silently drive
+# an automated action ceiling.
+
+_CROSS_CUSTOMER_SIGNALS_GROUP_ID = "cross_customer_signals"
+
+
+def log_cross_customer_signal(customer_id: str, signal_type: str, signal_value: str,
+                               case_id: str = None, occurred_at: datetime = None) -> dict:
+    """Logs one occurrence of a shareable signal (e.g. a payment
+    fingerprint) under the SHARED cross-customer group_id, not the
+    customer's own - so Graphiti's OWN entity extraction and dedup,
+    operating within that one shared space, has a genuine chance to
+    recognize the SAME signal_value mentioned by a DIFFERENT customer
+    later and relate the two. The episode content explicitly names both
+    the customer and the signal ("customer CUST-X used payment method
+    fp_abc") specifically to give the extraction LLM a concrete, minimal
+    text to work from, rather than raw JSON alone.
+
+    Returns {} (never raises) when Graphiti isn't configured (no
+    GROQ_API_KEY) - there is no meaningful shared-graph signal to log in
+    that case, same "unavailable is a normal state" discipline as
+    find_related_fraud_signals()."""
+    if not _is_graphiti_available():
+        return {}
+    occurred_at = occurred_at or datetime.now(timezone.utc)
+    content = {
+        "customer_id": customer_id, "signal_type": signal_type, "signal_value": signal_value,
+        "narrative": f"Customer {customer_id} is associated with {signal_type} {signal_value}.",
+    }
+    _run_async(_add_episode_async(
+        customer_id=customer_id, episode_type="cross_customer_signal", content=content,
+        occurred_at=occurred_at, case_id=case_id, group_id_override=_CROSS_CUSTOMER_SIGNALS_GROUP_ID,
+    ))
+    return {"customer_id": customer_id, "signal_type": signal_type, "signal_value": signal_value}
+
+
+def log_cross_customer_signal_async(customer_id: str, signal_type: str, signal_value: str,
+                                     case_id: str = None) -> str | None:
+    """Async wrapper - same job-queue pattern as
+    app/memory/episodic.py's log_episode_async(), and for the identical
+    reason (a Graphiti/Neo4j/Groq round trip must not sit on the case-
+    resolution/fraud-decision hot path). Returns None (not a job_id)
+    when Graphiti isn't configured - nothing meaningful to enqueue, same
+    as log_cross_customer_signal()'s own {} return in that case."""
+    if not _is_graphiti_available():
+        return None
+    from app.workers.job_queue import get_job_queue
+    from app.workers.handlers import handle_log_cross_customer_signal
+    q = get_job_queue()
+    q.register_handler("log_cross_customer_signal", handle_log_cross_customer_signal)
+    q.start_worker()
+    return q.enqueue("log_cross_customer_signal", {
+        "customer_id": customer_id, "signal_type": signal_type, "signal_value": signal_value,
+        "case_id": case_id,
+    })
+
+
+def search_cross_customer_relations(query_text: str, num_results: int = 10) -> list[dict]:
+    """Genuine Graphiti-native relationship search, scoped to the shared
+    cross-customer group (see log_cross_customer_signal above) - this is
+    what actually answers "does Graphiti have relations now": a real
+    call to Graphiti's own hybrid search (semantic + BM25 + graph
+    traversal), not a raw Cypher query. Returns the matching facts
+    Graphiti's extraction found, as plain dicts.
+
+    Best-effort by design - returns [] (never raises) when Graphiti
+    isn't configured, or on any real search error (a down Neo4j
+    instance, a malformed query), logged but non-fatal. This is
+    exploratory/audit context, never something an automated decision
+    should depend on existing - see this section's module comment for
+    why."""
+    import logging
+    logger = logging.getLogger("graphiti_adapter")
+    if not _is_graphiti_available():
+        return []
+    try:
+        return _run_async(_search_cross_customer_relations_async(query_text, num_results))
+    except Exception as e:
+        logger.warning("search_cross_customer_relations failed (non-fatal, returning no signal): %s", e)
+        return []
+
+
+async def _search_cross_customer_relations_async(query_text: str, num_results: int) -> list[dict]:
+    client = _build_graphiti_client()
+    try:
+        await _wait_for_neo4j_driver_init(client)
+        edges = await client.search(
+            query_text, group_ids=[_CROSS_CUSTOMER_SIGNALS_GROUP_ID], num_results=num_results,
+        )
+        return [{"fact": edge.fact, "name": edge.name, "uuid": edge.uuid} for edge in edges]
+    finally:
+        await client.close()
+
+
 def log_episode_graphiti(customer_id: str, episode_type: str, content: dict,
                           occurred_at: datetime, case_id: str = None) -> dict:
     _run_async(_add_episode_async(customer_id, episode_type, content, occurred_at, case_id))
@@ -401,3 +550,188 @@ def log_episode_graphiti(customer_id: str, episode_type: str, content: dict,
 
 def get_customer_history_graphiti(customer_id: str, episode_type: str = None, limit: int = 20) -> list:
     return _run_async(_get_customer_history_async(customer_id, episode_type, limit))
+
+
+# --- Cross-customer fraud query (Stage 1 memory upgrade) -------------------
+#
+# Real multi-hop, CROSS-CUSTOMER fraud query — deliberately NOT built on
+# Graphiti's own automatic entity extraction/dedup. Two independent
+# reasons, found by reading graphiti-core 0.30.2's actual source rather
+# than assuming:
+#
+#   1. Graphiti's entity/edge deduplication scopes its candidate search
+#      to the episode's own group_id (confirmed directly in
+#      graphiti_core/utils/maintenance/edge_operations.py:
+#      `group_ids=[extracted_edge.group_id]`) — and this project sets
+#      group_id=customer_id per episode (see _add_episode_async below).
+#      Two different customers' episodes therefore NEVER get their
+#      extracted entities merged/linked automatically; each customer's
+#      graph is its own isolated island BY DESIGN (group_id is Graphiti's
+#      multi-tenant isolation mechanism). A cross-customer fraud link
+#      cannot be discovered through Graphiti's own extraction pipeline as
+#      currently configured, no matter what text is fed into it.
+#   2. Even setting that aside, relying on an LLM to consistently extract
+#      "the same card" as an identically-named entity across separately
+#      -written episodes is inherently non-deterministic — a real fraud
+#      check needs an exact match, not a "the model probably phrased it
+#      the same way" match.
+#
+# So this queries the underlying Episodic nodes DIRECTLY — the raw
+# content this project's own code writes deterministically (see
+# _add_episode_async's json.dumps call), not the fuzzy Entity graph
+# Graphiti extracts on top of it — via a direct Cypher call through the
+# real Neo4j driver. Verified against graphiti-core 0.30.2's actual (not
+# assumed) Neo4j schema by reading node_db_queries.py/edge_db_queries.py
+# directly: Episodic nodes carry {uuid, name, group_id, content, ...},
+# where `content` is exactly the JSON string this project writes.
+# MENTIONS/RELATES_TO edges (the LLM-extracted layer) are not involved
+# in this query at all.
+#
+# NEO4J-ONLY: Kuzu (the embedded, dev-only fallback) uses a different
+# query dialect and is not wired here — this returns [] with a clear log
+# message rather than silently doing nothing, so the gap is visible
+# rather than mistaken for "no related fraud found." Also returns []
+# (silently — this is the normal/expected state, not an error) when
+# Graphiti/Groq isn't configured at all. The fraud agent
+# (app/agents/workflow_agents.py) must never break or change its
+# behavior just because this signal happens to be unavailable.
+
+_RELATED_FRAUD_SIGNALS_QUERY = """
+MATCH (matching_episode:Episodic)
+WHERE matching_episode.group_id <> $exclude_customer_id
+  AND matching_episode.content CONTAINS $fingerprint_marker
+WITH DISTINCT matching_episode.group_id AS other_customer_id
+MATCH (fraud_episode:Episodic {group_id: other_customer_id})
+WHERE fraud_episode.content CONTAINS $fraud_marker
+RETURN DISTINCT other_customer_id,
+       fraud_episode.uuid AS fraud_episode_uuid,
+       fraud_episode.created_at AS flagged_at
+"""
+
+
+def _to_iso_string(value) -> str | None:
+    """Converts a timestamp value from whatever the active graph
+    backend's driver returns into a plain, JSON-safe ISO string.
+    Handles every real case seen so far, checked - not guessed -
+    against real drivers: neo4j.time.DateTime (the real Neo4j Aura
+    driver's own temporal type, which has its own .iso_format() and is
+    NOT a stdlib datetime, found the hard way against a live Aura
+    instance - see the docstring at this function's call site), a
+    plain stdlib datetime.datetime, an already-a-string value, or None
+    (no timestamp on the row). Never raises - a formatting quirk in a
+    timestamp must not break the whole fraud check; falls back to
+    str(value) for anything unrecognized rather than losing the field
+    entirely."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if hasattr(value, "iso_format"):  # neo4j.time.DateTime and similar
+        return value.iso_format()
+    if hasattr(value, "isoformat"):  # stdlib datetime.datetime
+        return value.isoformat()
+    return str(value)
+
+
+def find_related_fraud_signals(payment_fingerprint: str, exclude_customer_id: str) -> list[dict]:
+    """Given a payment fingerprint (see app/tools/oms.py's
+    compute_payment_fingerprint), finds OTHER customers (excluding the
+    one currently under review) who have ever logged an episode
+    mentioning the same fingerprint AND have a fraud_flag_raised episode
+    of their own. Returns [] — never raises — when the signal genuinely
+    isn't available (no fingerprint, Graphiti/Neo4j not configured, or a
+    real query error), so callers can always treat this as "additional
+    context, possibly empty" rather than something they need to guard
+    against failing.
+
+    Returns a list of {"customer_id", "fraud_episode_id", "flagged_at"}
+    dicts — one entry per OTHER customer found, not per matching episode
+    (a customer with multiple fraud episodes still appears once, via the
+    query's DISTINCT).
+    """
+    import logging
+    logger = logging.getLogger("graphiti_adapter")
+
+    if not payment_fingerprint:
+        return []
+
+    if not _is_graphiti_available():
+        return []
+
+    from app.core.config import get_settings
+    settings = get_settings()
+    if not settings.neo4j_uri:
+        logger.info(
+            "find_related_fraud_signals skipped: Neo4j Aura not configured (NEO4J_URI unset). "
+            "This cross-customer fraud query requires Neo4j - the embedded Kuzu fallback "
+            "(this deployment's current active backend) is not wired for it. Set NEO4J_URI "
+            "to enable — see .env.example's Neo4j Aura section."
+        )
+        return []
+
+    try:
+        return _run_async(_find_related_fraud_signals_async(payment_fingerprint, exclude_customer_id))
+    except Exception as e:
+        # Same non-fatal discipline as log_episode()'s callers throughout
+        # this project (resolution_completion.py, orchestrator.py): a
+        # genuinely down/misconfigured Neo4j instance must never break
+        # fraud scoring — it should just mean this ONE extra signal is
+        # unavailable for this call, same as if no fingerprint existed.
+        logger.warning("find_related_fraud_signals failed (non-fatal, returning no signal): %s", e)
+        return []
+
+
+async def _find_related_fraud_signals_async(payment_fingerprint: str, exclude_customer_id: str) -> list[dict]:
+    from app.core.config import get_settings
+    settings = get_settings()
+    from graphiti_core.driver.neo4j_driver import Neo4jDriver
+
+    # Fresh driver per call, same reasoning as _build_graphiti_client()'s
+    # docstring: a cached async driver's connection pool binds to
+    # whichever event loop was active at construction, and _run_async()
+    # tears down its event loop after every call.
+    driver = Neo4jDriver(
+        uri=settings.neo4j_uri, user=settings.neo4j_user, password=settings.neo4j_password,
+        database=settings.neo4j_database,
+    )
+    try:
+        # Exact-match substring markers against the deterministic JSON
+        # this project's own code writes (json.dumps with default
+        # separators: '"key": "value"') - sufficient for an exact-match
+        # fraud signal and avoids an APOC/JSON-parsing dependency that
+        # may not be enabled on every Neo4j Aura free-tier instance.
+        result = await driver.execute_query(
+            _RELATED_FRAUD_SIGNALS_QUERY,
+            params={
+                "exclude_customer_id": exclude_customer_id,
+                "fingerprint_marker": f'"payment_fingerprint": "{payment_fingerprint}"',
+                "fraud_marker": '"episode_type": "fraud_flag_raised"',
+            },
+        )
+        return [
+            {
+                "customer_id": record["other_customer_id"],
+                "fraud_episode_id": record["fraud_episode_uuid"],
+                # REAL BUG, found only against a live Neo4j Aura instance
+                # (this sandbox's mocked tests never caught it, since
+                # they hand back plain strings): the neo4j Python
+                # driver returns its OWN temporal type
+                # (neo4j.time.DateTime) for a Cypher-returned
+                # timestamp property, NOT a stdlib datetime.datetime -
+                # and it is not JSON-serializable. This value flows
+                # into fraud_result, then into AuditLogEntry.detail (a
+                # JSON column), so leaving it as-is crashed the whole
+                # aggregate_node commit with "Object of type DateTime
+                # is not JSON serializable" - AFTER the fraud check had
+                # already correctly found the match (confirmed against
+                # a real deployment: risk_score=0.95, flag=True). Fixed
+                # by explicitly converting to an ISO string here, at
+                # the query boundary, so every caller always gets a
+                # plain, JSON-safe string regardless of what the
+                # backend driver happens to return.
+                "flagged_at": _to_iso_string(record["flagged_at"]),
+            }
+            for record in result.records
+        ]
+    finally:
+        await driver.close()

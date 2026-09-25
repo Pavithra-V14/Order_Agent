@@ -33,6 +33,10 @@ class ResolutionDecision(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str = Field(min_length=10, description="Why this action was chosen, in plain language")
     cited_policy: CitedPolicy | None = None
+    # Set by the rules when the evidence can't support an automated
+    # action (inconclusive diagnosis, LLM claim contradicted by tool
+    # data). Routing always ESCALATES such a decision, at any threshold.
+    requires_human_review: bool = False
 
 
 class RoutingOutcome(str, Enum):

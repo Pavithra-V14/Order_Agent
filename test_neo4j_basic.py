@@ -9,11 +9,13 @@ Fill in your own URI/user/password below first.
 """
 from neo4j import GraphDatabase
 
-URI = "neo4j+s://YOUR-INSTANCE-ID.databases.neo4j.io"
+URI = "neo4j+ssc://f97a202d.databases.neo4j.io"
 USER = "neo4j"
-PASSWORD = "YOUR-PASSWORD"
+PASSWORD = "Orz8wMDXKICjjZqohJiWSegv9zuh8oIuKQbErRkPuYw"
 
-
+from dotenv import load_dotenv
+load_dotenv(override=True)  # loads .env file into os.environ
+print(f"NEO4J_URI={URI}, NEO4J_USERNAME={USER}, NEO4J_PASSWORD={PASSWORD}")
 def test_normal():
     """The real, secure connection - same as your actual app will use."""
     print("=== Normal (verified TLS) connection ===")

@@ -14,6 +14,7 @@ venv/
 # Python cache
 # =========================
 __pycache__/
+*.pyc
 *.py[cod]
 *$py.class
 
@@ -52,3 +53,7 @@ dump.rdb
 cmd.txt
 *.tmp
 *.log
+# =========================
+# Live-LLM evaluation reports (scripts/run_live_llm_eval.py)
+# =========================
+data/eval/

@@ -225,3 +225,4 @@ neo4j>=5.0                          # driver Graphiti's Neo4jDriver uses — act
 # even with the server correctly running.
 toxiproxy-python>=0.1
 
+filelock>=3.12

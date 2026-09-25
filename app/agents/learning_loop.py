@@ -16,6 +16,7 @@ deliberately separate:
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -62,30 +63,118 @@ class SimilarPastCase:
     similarity: float
 
 
+# --- Stage 3 memory upgrade: cached similarity index ------------------------
+#
+# retrieve_similar_past_resolutions() previously refit a fresh TF-IDF
+# vectorizer over the ENTIRE ResolutionPatternEntry table on EVERY SINGLE
+# resolution decision - an O(n) full-corpus refit call sitting in the
+# live decision path, that would visibly slow down as case history grows
+# into the thousands. Cached here, invalidated by ROW COUNT: this table
+# is append-only in this codebase (record_resolution_outcome is the only
+# writer, and nothing anywhere calls db.delete() on it) - so an unchanged
+# count reliably means the cached fit is still valid, and a changed count
+# reliably means new rows were added and a refit is genuinely needed.
+# get_embedder() itself returns a FRESH, unfitted instance on every call
+# (see app/rag/embeddings.py) - not a singleton - so this module owns its
+# own fitted-instance cache rather than relying on the factory for it.
+#
+# ACCURACY NOTE, checked directly rather than assumed: the old code fit
+# the vectorizer on [entries... , query_text] TOGETHER, so a word unique
+# to the query entered the vocabulary too. This version fits ONLY on the
+# entries corpus and embeds the query afterward via the already-fitted
+# vectorizer (a query word absent from that vocabulary is simply
+# dropped). This produces IDENTICAL similarity rankings to the old
+# behavior: similarity is a dot product (entry_vecs @ query_vec), and any
+# vocabulary term that appears ONLY in the query and in no entry
+# contributes exactly 0 to every entry's score either way, since every
+# entry's TF-IDF value for that term is 0 regardless of whether the term
+# was ever added to the vectorizer's vocabulary. Verified with a
+# regression test (tests/test_few_shot_retrieval_caching.py) comparing
+# this cached path's ranking against the old fit-every-call approach on
+# a fixed corpus, not just argued here.
+
+_similarity_cache_lock = threading.Lock()
+_similarity_cache: dict = {"row_count": None, "embedder": None, "entries": None, "entry_vectors": None}
+
+
+def _get_or_refit_similarity_index(db: Session):
+    """Returns (embedder, entries, entry_vectors) for the current
+    ResolutionPatternEntry corpus, refitting only when the row count has
+    changed since the last call. Thread-safe (plain lock) - this is
+    called from resolution_policy_workflow.py's single-threaded decision
+    path, not the orchestrator's parallel diagnosis fan-out, so lock
+    contention here is not a real concern; the lock exists for
+    correctness under concurrent requests, not for a hot loop.
+
+    `entries` here is a list of plain dicts, NOT live ORM objects -
+    deliberately. This codebase's standard pattern is `db = SessionLocal()
+    ... finally: db.close()` per call (see every agent node in
+    orchestrator.py), so a cache hit on a LATER call, handed a
+    DIFFERENT db session than the one active when the cache was last
+    populated, would otherwise return ORM objects bound to a session
+    that may already be closed - a real DetachedInstanceError risk the
+    first version of this cache didn't account for. Extracting plain
+    data at fit time avoids this entirely; the cache never holds a
+    reference to any SQLAlchemy session or its objects.
+    """
+    with _similarity_cache_lock:
+        current_count = db.query(ResolutionPatternEntry).count()
+        if _similarity_cache["embedder"] is not None and _similarity_cache["row_count"] == current_count:
+            return _similarity_cache["embedder"], _similarity_cache["entries"], _similarity_cache["entry_vectors"]
+
+        rows = db.query(ResolutionPatternEntry).all()
+        entries = [
+            {"case_id": e.case_id, "case_feature_summary": e.case_feature_summary,
+             "human_final_resolution": e.human_final_resolution}
+            for e in rows
+        ]
+        embedder = get_embedder()
+        entry_vectors = None
+        if entries:
+            corpus = [e["case_feature_summary"] for e in entries]
+            embedder.fit(corpus)
+            entry_vectors = embedder.embed(corpus)
+
+        _similarity_cache.update(
+            row_count=current_count, embedder=embedder, entries=entries, entry_vectors=entry_vectors,
+        )
+        return embedder, entries, entry_vectors
+
+
+def invalidate_similarity_cache() -> None:
+    """Explicit invalidation - forces the next retrieve_similar_past_resolutions()
+    call to refit regardless of row count. Not required for correctness
+    (the row-count check in _get_or_refit_similarity_index already
+    catches every real change record_resolution_outcome makes) - exists
+    for tests that want a deterministic fresh state, and as a documented
+    escape hatch if this table is ever mutated outside
+    record_resolution_outcome (e.g. a future admin/data-cleanup script)
+    in a way that coincidentally leaves the row count unchanged."""
+    with _similarity_cache_lock:
+        _similarity_cache.update(row_count=None, embedder=None, entries=None, entry_vectors=None)
+
+
 def retrieve_similar_past_resolutions(db: Session, query_feature_summary: str, k: int = 3) -> list:
     """Dynamic few-shot retrieval - finds the k most similar PAST resolved
     cases by lexical similarity over case_feature_summary, for use as
     in-context examples. Uses the same TfidfEmbedder as the RAG layer
-    rather than a separate mechanism."""
-    entries = db.query(ResolutionPatternEntry).all()
+    rather than a separate mechanism. The corpus fit is cached (see
+    _get_or_refit_similarity_index above) - only the query itself is
+    embedded fresh on every call, since it's different every time by
+    definition and embedding one short string is cheap."""
+    embedder, entries, entry_vectors = _get_or_refit_similarity_index(db)
     if not entries:
         return []
 
-    corpus = [e.case_feature_summary for e in entries] + [query_feature_summary]
-    embedder = get_embedder()
-    embedder.fit(corpus)
-    vectors = embedder.embed(corpus)
-    query_vec = vectors[-1]
-    entry_vecs = vectors[:-1]
-
-    similarities = entry_vecs @ query_vec
+    query_vec = embedder.embed([query_feature_summary])[0]
+    similarities = entry_vectors @ query_vec
 
     ranked_idx = np.argsort(-similarities)[:k]
     return [
         SimilarPastCase(
-            case_id=entries[i].case_id,
-            case_feature_summary=entries[i].case_feature_summary,
-            human_final_resolution=entries[i].human_final_resolution,
+            case_id=entries[i]["case_id"],
+            case_feature_summary=entries[i]["case_feature_summary"],
+            human_final_resolution=entries[i]["human_final_resolution"],
             similarity=float(similarities[i]),
         )
         for i in ranked_idx

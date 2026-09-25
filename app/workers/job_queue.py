@@ -38,6 +38,20 @@ from datetime import datetime, timezone
 from enum import Enum
 
 
+# Lanes: short housekeeping jobs must never wait behind a case pipeline
+# that can spend 30s+ in LLM calls. Before lanes, a single worker thread
+# ran everything in order, so an inventory update (which invalidates the
+# stock cache the next diagnosis reads) could sit behind several
+# pipelines - exactly the stale-stock window it exists to close.
+FAST_LANE = "fast"
+SLOW_LANE = "slow"
+_SLOW_JOB_TYPES = frozenset({"process_oms_webhook", "process_carrier_webhook", "tier3_judge_sample"})
+
+
+def lane_for(job_type: str) -> str:
+    return SLOW_LANE if job_type in _SLOW_JOB_TYPES else FAST_LANE
+
+
 class JobStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -59,16 +73,27 @@ class Job:
 
 
 class InProcessJobQueue:
-    """One background worker thread processes jobs sequentially, all
-    within this process. Handlers are registered by job_type - each
-    handler takes the job payload dict and returns a result dict."""
+    """Background worker threads inside this process, one pool per lane
+    (see lane_for): the fast lane keeps a dedicated worker so housekeeping
+    never waits behind a case pipeline; the slow lane runs
+    JOB_QUEUE_SLOW_WORKERS pipelines in parallel. Handlers are registered
+    by job_type - each takes the payload dict and returns a result dict."""
 
-    def __init__(self):
-        self._queue = queue.Queue()
+    def __init__(self, slow_workers: int | None = None):
+        if slow_workers is None:
+            from app.core.config import get_settings
+            settings = get_settings()
+            slow_workers = settings.job_queue_slow_workers
+            # SQLite allows one writer at a time; parallel pipelines would
+            # just contend for its lock ("database is locked").
+            if settings.database_url.startswith("sqlite"):
+                slow_workers = 1
+        self._lanes = {FAST_LANE: queue.Queue(), SLOW_LANE: queue.Queue()}
+        self._lane_sizes = {FAST_LANE: 1, SLOW_LANE: max(1, int(slow_workers))}
         self._jobs = {}
         self._handlers = {}
         self._lock = threading.Lock()
-        self._worker_thread = None
+        self._worker_threads: list[threading.Thread] = []
         self._stop_event = threading.Event()
 
     def register_handler(self, job_type, handler) -> None:
@@ -81,7 +106,7 @@ class InProcessJobQueue:
         job = Job(id=job_id, job_type=job_type, payload=payload)
         with self._lock:
             self._jobs[job_id] = job
-        self._queue.put(job_id)
+        self._lanes[lane_for(job_type)].put(job_id)
         return job_id
 
     def get_job(self, job_id):
@@ -89,21 +114,28 @@ class InProcessJobQueue:
             return self._jobs.get(job_id)
 
     def start_worker(self) -> None:
-        if self._worker_thread is not None and self._worker_thread.is_alive():
+        if any(t.is_alive() for t in self._worker_threads):
             return
         self._stop_event.clear()
-        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
-        self._worker_thread.start()
+        self._worker_threads = [
+            threading.Thread(target=self._worker_loop, args=(lane,), daemon=True, name=f"jobs-{lane}-{i}")
+            for lane, size in self._lane_sizes.items() for i in range(size)
+        ]
+        for t in self._worker_threads:
+            t.start()
 
     def stop_worker(self, timeout=2.0) -> None:
         self._stop_event.set()
-        self._queue.put(None)
-        if self._worker_thread is not None:
-            self._worker_thread.join(timeout=timeout)
+        for lane, size in self._lane_sizes.items():
+            for _ in range(size):
+                self._lanes[lane].put(None)
+        for t in self._worker_threads:
+            t.join(timeout=timeout)
 
-    def _worker_loop(self) -> None:
+    def _worker_loop(self, lane: str) -> None:
+        q = self._lanes[lane]
         while not self._stop_event.is_set():
-            job_id = self._queue.get()
+            job_id = q.get()
             if job_id is None:
                 continue
             self._process_job(job_id)
@@ -167,13 +199,15 @@ class RQJobQueue:
     reachable to the same Redis instance.
     """
 
-    QUEUE_NAME = "order_exception_agent"
+    QUEUE_NAME = "order_exception_agent"                 # slow lane (pre-existing name, so running workers keep working)
+    FAST_QUEUE_NAME = "order_exception_agent_fast"
 
     def __init__(self, redis_url: str):
         import redis as redis_lib
         from rq import Queue
         self._redis_conn = redis_lib.from_url(redis_url)
-        self._queue = Queue(self.QUEUE_NAME, connection=self._redis_conn)
+        self._queues = {SLOW_LANE: Queue(self.QUEUE_NAME, connection=self._redis_conn),
+                        FAST_LANE: Queue(self.FAST_QUEUE_NAME, connection=self._redis_conn)}
         self._handlers: dict[str, callable] = {}
 
     def register_handler(self, job_type: str, handler) -> None:
@@ -188,7 +222,7 @@ class RQJobQueue:
         handler = self._handlers.get(job_type)
         if handler is None:
             raise ValueError(f"No handler registered for job_type {job_type!r}")
-        job = self._queue.enqueue(handler, payload, job_timeout="5m")
+        job = self._queues[lane_for(job_type)].enqueue(handler, payload, job_timeout="5m")
         return job.id
 
     def get_job(self, job_id: str):

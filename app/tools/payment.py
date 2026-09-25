@@ -27,6 +27,12 @@ class PaymentGateway(ABC):
     def issue_refund(self, db: Session, payment_intent_id: str, amount_usd: float,
                       idempotency_key: str) -> dict: ...
 
+    def get_refund(self, refund_id: str) -> dict | None:
+        """Independent lookup of a refund at the provider, used by the
+        Verification Agent. None means this gateway can't look refunds up
+        (the fake gateway verifies from its local idempotency record)."""
+        return None
+
     def seed_transaction(self, payment_intent_id: str, amount_usd: float, status: str = "succeeded") -> None:
         """No-op on the base class, overridden with real behavior only by
         FakePaymentGateway. A real gateway's transaction state is
@@ -74,6 +80,10 @@ class StripeGateway(PaymentGateway):
             amount=int(round(amount_usd * 100)),
             idempotency_key=idempotency_key,
         )
+        return {"id": refund.id, "status": refund.status, "amount": refund.amount / 100}
+
+    def get_refund(self, refund_id: str) -> dict | None:
+        refund = self._stripe.Refund.retrieve(refund_id)
         return {"id": refund.id, "status": refund.status, "amount": refund.amount / 100}
 
 

@@ -151,19 +151,18 @@ def test_resolution_result_contract_matches_execution_agent_input(isolated_db):
     db = isolated_db.SessionLocal()
     get_payment_gateway().seed_transaction("pi_contract_3", amount_usd=30.0)  # defaults to status="succeeded"
 
+    from datetime import date, timedelta
+    # A plain return inside the policy window - the refundable scenario.
+    # (The old scenario, "payment_issue" on a SUCCEEDED charge, now goes to
+    # a human: the gateway contradicts the claim.)
     result = run_resolution_policy_workflow(
-        diagnosis_root_causes=["payment_issue: transaction status is 'declined'"],
+        diagnosis_root_causes=["no_anomaly_detected: all checked systems report normal state"],
+        purchase_date=(date.today() - timedelta(days=10)).isoformat(), product_category="apparel",
+        return_window_days_by_category={"apparel": 180, "all": 180},
         inventory_result={"any_shortfall": False}, order_amount_usd=30.0,
         fraud_flag_present=False, auto_execute_confidence_threshold=0.90,
         auto_execute_value_ceiling_usd=50.0, retrieved_policy_doc_id="RET-POLICY-2025-A",
-        retrieved_policy_version="1",
-        # Matches the actually-seeded transaction status above — the
-        # orchestrator normally extracts and passes this automatically
-        # from real diagnosis findings; this test calls
-        # run_resolution_policy_workflow directly, so it must supply
-        # the same real value itself to keep the scenario internally
-        # consistent (a genuinely succeeded payment IS refundable).
-        payment_status="succeeded",
+        retrieved_policy_version="1", payment_status="succeeded",
     )
     assert isinstance(result.decision, ResolutionDecision), (
         "execute_resolution() accesses decision.action/.amount_usd as attributes - "

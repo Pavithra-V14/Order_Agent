@@ -20,6 +20,8 @@ from datetime import date, datetime
 from app.guardrails.schema import ResolutionDecision, ResolutionAction, CitedPolicy, ResolutionResult, RoutingOutcome
 from app.guardrails.tier1_ceilings import check_tier1_ceilings
 from app.guardrails.tier2_structural import run_tier2
+from app.agents.root_causes import (parse_root_causes, carrier_fault_confirmed, INCONCLUSIVE_CATEGORIES,
+                                    PAYMENT, INVENTORY, CARRIER, NO_ANOMALY)
 
 
 def _resolve_window_days(return_window_days_by_category: dict | None, product_category: str | None) -> int | None:
@@ -66,8 +68,23 @@ def propose_resolution_decision(
     product_category: str = None,
     return_window_days_by_category: dict = None,
     payment_status: str = None,
+    diagnosis_findings: dict = None,
 ) -> ResolutionDecision:
     """Rule-based decision proposal - bounded logic, not open reasoning.
+
+    Root causes are PARSED into fixed categories (app/agents/root_causes.py)
+    and each LLM claim must be backed by tool evidence before it can move
+    money. Anything inconclusive - a diagnosis that timed out or hit its
+    step ceiling, an unrecognized cause, a claim the tool data contradicts,
+    or no causes at all - produces a requires_human_review decision, never
+    a refund. (Previously the final fall-through branch proposed a FULL
+    REFUND at 0.93 confidence for all of these; reproduced end to end in
+    tests/test_review_evidence.py.)
+
+    diagnosis_findings: the Diagnosis Agent's raw tool findings. When
+    given (the live pipeline always does), a carrier_issue only counts if
+    the carrier gateway actually reported a fault status.
+
     This is the piece that would eventually call a reasoning-tier LLM
     (per architecture doc 8.10) to draft `reasoning` in more natural
     language, but the ACTION and AMOUNT selection logic stays rule-based
@@ -92,12 +109,9 @@ def propose_resolution_decision(
     the window, or when the window data isn't available at all (a
     missing citation is still refused rather than silently approved).
     """
-    causes_text = " | ".join(diagnosis_root_causes)
-    has_inventory_issue = "inventory_issue" in causes_text
-    has_payment_issue = "payment_issue" in causes_text
-    has_carrier_issue = "carrier_issue" in causes_text
-    has_no_anomaly = "no_anomaly_detected" in causes_text
-    any_shortfall = bool(inventory_result.get("any_shortfall"))
+    causes = parse_root_causes(diagnosis_root_causes)
+    categories = {c.category for c in causes}
+    any_shortfall = bool((inventory_result or {}).get("any_shortfall"))
 
     cited = None
     if retrieved_policy_doc_id:
@@ -106,6 +120,56 @@ def propose_resolution_decision(
             version=retrieved_policy_version or "unknown",
             clause_summary="Return window and refund processing terms",
         )
+
+    def _needs_human(why: str) -> ResolutionDecision:
+        return ResolutionDecision(
+            action=ResolutionAction.DENY, amount_usd=0.0, confidence=0.0,
+            reasoning=f"No automated action taken - {why} A human reviewer must choose the "
+                      f"resolution; approving this proposal as-is records no refund.",
+            cited_policy=cited, requires_human_review=True,
+        )
+
+    if not causes:
+        return _needs_human("the diagnosis returned no root causes.")
+    inconclusive = [c.raw for c in causes if c.category in INCONCLUSIVE_CATEGORIES]
+    if inconclusive:
+        return _needs_human(f"the diagnosis was inconclusive ({'; '.join(inconclusive)}).")
+
+    # Evidence checks: an LLM-stated category only counts when the
+    # structured tool data backs it up.
+    has_inventory_issue = INVENTORY in categories and any_shortfall
+    carrier_evidence = carrier_fault_confirmed(diagnosis_findings)
+    has_carrier_issue = CARRIER in categories and carrier_evidence is not False
+    has_payment_issue = PAYMENT in categories
+    has_no_anomaly = NO_ANOMALY in categories
+    unsupported = [c.raw for c in causes
+                   if (c.category == INVENTORY and not any_shortfall)
+                   or (c.category == CARRIER and carrier_evidence is False)]
+
+    if has_no_anomaly and (has_inventory_issue or has_carrier_issue or has_payment_issue):
+        return _needs_human("the diagnosis reported both 'no anomaly' and a specific fault, "
+                            "which contradict each other.")
+    # 'No anomaly' must also agree with the tool data itself - the live-LLM
+    # eval caught the real model saying "no anomaly" on a stock shortfall
+    # that the inventory agent had detected, which would otherwise have
+    # gone down the return-window refund path.
+    if has_no_anomaly:
+        contradictions = []
+        if any_shortfall:
+            contradictions.append("the inventory check found a stock shortfall")
+        if payment_status not in (None, "succeeded"):
+            contradictions.append(f"the payment gateway reports status {payment_status!r}")
+        if carrier_evidence:
+            contradictions.append("the carrier reports a delivery fault")
+        if contradictions:
+            return _needs_human(f"the diagnosis reported no anomaly, but {' and '.join(contradictions)}.")
+    if has_payment_issue and payment_status == "succeeded":
+        return _needs_human("the diagnosis reported a payment issue, but the payment gateway "
+                            "confirms the charge succeeded; the claimed issue is not supported "
+                            "by tool evidence.")
+    if unsupported and not (has_inventory_issue or has_carrier_issue or has_payment_issue or has_no_anomaly):
+        return _needs_human(f"the reported cause(s) are not supported by the tool findings "
+                            f"({'; '.join(unsupported)}).")
 
     if has_no_anomaly:
         window_days = _resolve_window_days(return_window_days_by_category, product_category)
@@ -207,18 +271,10 @@ def propose_resolution_decision(
         # canceled, processing (not yet settled), requires_capture
         # (authorized but not captured — not confirmed yet either).
         # "succeeded" is the only status that means money was genuinely
-        # taken and is refundable.
-        if payment_status == "succeeded":
-            return ResolutionDecision(
-                action=ResolutionAction.REFUND,
-                amount_usd=order_amount_usd,
-                confidence=0.92,
-                reasoning="Payment gateway confirms this payment DID succeed, but a payment_issue "
-                          "was still flagged (e.g. an incorrect charge amount or a separate billing "
-                          "dispute) - refunding the full order amount since the customer was "
-                          "genuinely, successfully charged.",
-                cited_policy=cited,
-            )
+        # taken. A payment_issue claim on a SUCCEEDED charge is already
+        # routed to a human above - the gateway contradicts the claim,
+        # and a real LLM was observed writing "payment_issue: ..." for a
+        # payment that was fine.
         return ResolutionDecision(
             action=ResolutionAction.DENY,
             amount_usd=0.0,
@@ -229,16 +285,12 @@ def propose_resolution_decision(
                       f"payment method, cancel the order, or something else) rather than either an "
                       f"automated refund of money that was never taken or a silent denial.",
             cited_policy=cited,
+            requires_human_review=True,
         )
 
-    return ResolutionDecision(
-        action=ResolutionAction.REFUND,
-        amount_usd=order_amount_usd,
-        confidence=0.93,
-        reasoning="Standard return request within the applicable policy's return window - approving "
-                  "a full refund per the cited policy terms.",
-        cited_policy=cited,
-    )
+    # Unreachable with the category checks above, kept as a hard stop:
+    # an unmatched combination must never default to moving money.
+    return _needs_human("no decision rule matched the reported causes.")
 
 
 def run_resolution_policy_workflow(
@@ -258,6 +310,8 @@ def run_resolution_policy_workflow(
     product_category: str = None,
     return_window_days_by_category: dict = None,
     payment_status: str = None,
+    diagnosis_findings: dict = None,
+    extra_escalation_reasons: list = None,
 ) -> ResolutionResult:
     """Full workflow: propose -> Tier 1 -> Tier 2 -> route.
 
@@ -272,7 +326,7 @@ def run_resolution_policy_workflow(
         diagnosis_root_causes, inventory_result, order_amount_usd,
         retrieved_policy_doc_id, retrieved_policy_version,
         purchase_date, product_category, return_window_days_by_category,
-        payment_status,
+        payment_status, diagnosis_findings,
     )
 
     similar_past_cases = []
@@ -330,8 +384,22 @@ def run_resolution_policy_workflow(
                                  routing_reasons=reasons, tier1_passed=True, tier2_passed=True,
                                  similar_past_cases=similar_past_cases)
 
+    # Mandatory human review - evaluated before any threshold, so neither
+    # a lowered threshold (learning loop) nor a high confidence can
+    # auto-execute these.
     from app.core.config import get_settings
-    if not get_settings().auto_execution_enabled:
+    settings = get_settings()
+    mandatory = list(extra_escalation_reasons or [])
+    if decision.requires_human_review:
+        mandatory.append("decision requires human review: evidence does not support an automated action")
+    if decision.action == ResolutionAction.DENY and not settings.auto_execute_denials:
+        mandatory.append("denials are never auto-executed (AUTO_EXECUTE_DENIALS=false) - a person confirms every 'no'")
+    if mandatory:
+        return ResolutionResult(decision=decision, routing=RoutingOutcome.ESCALATE,
+                                 routing_reasons=mandatory, tier1_passed=True, tier2_passed=True,
+                                 similar_past_cases=similar_past_cases)
+
+    if not settings.auto_execution_enabled:
         reasons.append("auto-execution is globally disabled (rollback switch, Phase 16) — "
                         "routing to human review regardless of confidence or value")
         return ResolutionResult(decision=decision, routing=RoutingOutcome.ESCALATE,

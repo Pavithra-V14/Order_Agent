@@ -49,11 +49,14 @@ def test_rollback_disables_auto_execution_for_all_new_cases_in_under_5_minutes(i
     """THE Phase 16 rollback test."""
     from app.core.config import get_settings
     from app.agents.resolution_policy_workflow import run_resolution_policy_workflow
+    from datetime import date, timedelta
 
     get_settings.cache_clear()
 
     result_before = run_resolution_policy_workflow(
-        diagnosis_root_causes=["payment_issue: transaction status is 'declined'"],
+        diagnosis_root_causes=["no_anomaly_detected: all checked systems report normal state"],
+        purchase_date=(date.today() - timedelta(days=10)).isoformat(), product_category="apparel",
+        return_window_days_by_category={"apparel": 180, "all": 180},
         inventory_result={"any_shortfall": False}, order_amount_usd=20.0,
         fraud_flag_present=False, auto_execute_confidence_threshold=0.90,
         auto_execute_value_ceiling_usd=50.0,
@@ -79,7 +82,9 @@ def test_rollback_disables_auto_execution_for_all_new_cases_in_under_5_minutes(i
     )
 
     result_after = run_resolution_policy_workflow(
-        diagnosis_root_causes=["payment_issue: transaction status is 'declined'"],
+        diagnosis_root_causes=["no_anomaly_detected: all checked systems report normal state"],
+        purchase_date=(date.today() - timedelta(days=10)).isoformat(), product_category="apparel",
+        return_window_days_by_category={"apparel": 180, "all": 180},
         inventory_result={"any_shortfall": False}, order_amount_usd=20.0,
         fraud_flag_present=False, auto_execute_confidence_threshold=0.90,
         auto_execute_value_ceiling_usd=50.0,

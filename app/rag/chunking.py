@@ -8,6 +8,7 @@ corrupted.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -42,8 +43,11 @@ def _policy_metadata_to_dict(meta: PolicyMetadata) -> dict:
     }
 
 
-def _split_into_child_chunks(text: str, max_sentences: int = 2) -> list[str]:
-    """Splits page text into small child chunks for precise retrieval.
+def _split_into_child_chunks(text: str, target_avg_sentences: int = 2, max_sentences: int = 4) -> list[str]:
+    """Splits page text into small child chunks for precise retrieval,
+    using CONTENT-DEFINED chunking - boundaries are placed based on
+    each sentence's own hash, not by counting position from the start
+    of the page.
 
     Real unstructured.io hi_res output gives proper per-element
     segmentation (Title, NarrativeText, ListItem as separate elements), so
@@ -55,17 +59,57 @@ def _split_into_child_chunks(text: str, max_sentences: int = 2) -> list[str]:
     chunking entirely (confirmed while testing Phase 3 against the real
     generated PDFs).
 
-    This uses a sentence-window split instead: group every N sentences
-    into one child chunk. It's a coarser signal than real layout-aware
-    segmentation, but it's honest, functional, and produces genuinely
-    separate, retrievable child nodes.
+    An earlier version of this grouped a FIXED count of sentences per
+    chunk ("every 2 sentences, sequentially from the top of the page").
+    That's position-dependent: inserting even one sentence near the top
+    of a page shifts every downstream grouping boundary, since chunk N
+    is defined as "the Nth pair of sentences counting from the start" -
+    confirmed directly with a real simulation where a single inserted
+    sentence caused every subsequent chunk on the page to look "new,"
+    even though most of the underlying sentences never changed a word.
+
+    This version instead decides each boundary from the CONTENT of the
+    sentence sitting at that boundary - a real, if simplified, form of
+    content-defined chunking (the same family of technique used by
+    rsync/restic/Borg for exactly this stability property). Whether
+    sentence S ends a chunk depends only on hash(S) itself, never on
+    how many sentences came before it - so inserting a new sentence
+    elsewhere on the page cannot change that decision for sentences
+    that were never touched. Confirmed directly: the same insertion
+    that broke every chunk under the old scheme now only affects the
+    one chunk actually containing the edit (plus, occasionally, its
+    immediate neighbor, if the edit lands right at an existing
+    boundary) - everything else on the page hashes identically to
+    before and is correctly skipped.
+
+    max_sentences remains as a hard ceiling (not the primary mechanism
+    anymore) purely to bound worst-case chunk size, since a
+    content-defined boundary could theoretically not occur for an
+    unusually long run of sentences.
     """
     sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z])", text.replace("\n", " ").strip())
     sentences = [s.strip() for s in sentences if s.strip()]
+    if not sentences:
+        return [text.strip()]
+
     chunks = []
-    for i in range(0, len(sentences), max_sentences):
-        chunks.append(" ".join(sentences[i:i + max_sentences]))
-    return chunks or [text.strip()]
+    current: list[str] = []
+    for sentence in sentences:
+        current.append(sentence)
+        sentence_hash = int(hashlib.sha256(sentence.encode("utf-8")).hexdigest(), 16)
+        # A boundary here depends ONLY on this sentence's own content
+        # and how many sentences have accumulated since the last
+        # boundary - never on this sentence's absolute position in the
+        # page, which is the property that makes this stable across
+        # insertions/deletions elsewhere on the page.
+        at_content_boundary = (sentence_hash % target_avg_sentences) == 0
+        at_hard_ceiling = len(current) >= max_sentences
+        if at_content_boundary or at_hard_ceiling:
+            chunks.append(" ".join(current))
+            current = []
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
 
 
 def build_nodes(elements: list[ExtractedElement], policy_meta: PolicyMetadata) -> list[RagNode]:
@@ -100,7 +144,23 @@ def build_nodes(elements: list[ExtractedElement], policy_meta: PolicyMetadata) -
                     element_type="text_child",
                     parent_id=parent_id,
                     page=el.page,
-                    content_hash=el.content_hash,  # inherits page-level hash for reindex diffing
+                    # Own, independently-computed hash - NOT inherited
+                    # from the parent page anymore. This is what
+                    # actually unlocks the benefit of content-defined
+                    # chunking above: with the OLD position-based
+                    # splitter, individual chunk boundaries weren't
+                    # stable across edits, so every child had to share
+                    # the whole page's hash and be treated as one
+                    # coarse unit for reindex diffing (an edit ANYWHERE
+                    # on the page correctly forced re-embedding
+                    # EVERYWHERE on the page, since there was no
+                    # reliable way to tell which specific chunk actually
+                    # changed). Content-defined boundaries ARE stable
+                    # for untouched regions, so each child can now be
+                    # diffed independently - re-ingestion re-embeds only
+                    # the handful of chunks whose own text genuinely
+                    # changed, not the entire page every time.
+                    content_hash=hashlib.sha256(chunk.encode("utf-8")).hexdigest(),
                     metadata=meta_dict,
                 ))
 

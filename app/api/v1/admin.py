@@ -109,6 +109,32 @@ def get_backend_status(_auth=Depends(require_admin)):
     }
 
 
+@router.post("/reconcile")
+def reconcile_endpoint(stale_after_minutes: float = 30.0, verify_timeout_hours: float = 72.0,
+                       _auth=Depends(require_admin)):
+    """One pass of the case reconciler (app/workers/reconciler.py): retries
+    PENDING_RETRY executions, re-verifies VERIFYING cases, and re-runs or
+    escalates cases stuck mid-pipeline. Trigger it from cron every few
+    minutes - this project has no in-process scheduler."""
+    from app.workers.reconciler import run_reconciliation
+    return run_reconciliation(stale_after_minutes=stale_after_minutes,
+                              verify_timeout_hours=verify_timeout_hours)
+
+
+@router.post("/evict-stale-buffers")
+def evict_stale_buffers_endpoint(max_age_seconds: float = 86400.0, _auth=Depends(require_admin)):
+    """Manually triggers the Summary Buffer TTL sweep (memory-upgrade
+    follow-up) - in production this runs on a schedule (same pattern as
+    /threshold-proposals/run-batch-job); exposed here so it doesn't
+    require waiting for a real stale buffer to accumulate to verify it
+    works, and so ops can run it on demand. Default 86400s (24h) matches
+    this project's other "abandoned case" assumptions; pass a smaller
+    value in a demo/test context to see it actually evict something."""
+    from app.memory.summary_buffer import evict_stale_buffers
+    evicted_count = evict_stale_buffers(max_age_seconds)
+    return {"evicted_count": evicted_count, "max_age_seconds": max_age_seconds}
+
+
 @router.delete("/audit-log")
 def delete_all_audit_log(confirm: bool = False, db: Session = Depends(get_db),
                           _auth=Depends(require_admin)):

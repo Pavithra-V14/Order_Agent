@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db, ThresholdProposalRecord, ThresholdOverrideRecord
+from app.core.auth import require_readonly, require_admin, CurrentPrincipal
 from app.agents.learning_loop import (
     propose_threshold_adjustments, accept_threshold_proposal, reject_threshold_proposal,
 )
@@ -11,7 +12,8 @@ router = APIRouter(prefix="/threshold-proposals", tags=["threshold"])
 
 
 @router.get("")
-def list_threshold_proposals(status: str = "pending_review", db: Session = Depends(get_db)):
+def list_threshold_proposals(status: str = "pending_review", db: Session = Depends(get_db),
+                              _auth=Depends(require_readonly)):
     """Per architecture doc 8.5/checklist Phase 13: 'Wire Threshold Config
     to display Phase 9's proposed-but-unapplied calibration changes with
     an explicit accept action.' This endpoint is that wiring - it reads
@@ -35,7 +37,7 @@ def list_threshold_proposals(status: str = "pending_review", db: Session = Depen
 
 
 @router.get("/active-overrides")
-def list_active_overrides(db: Session = Depends(get_db)):
+def list_active_overrides(db: Session = Depends(get_db), _auth=Depends(require_readonly)):
     """What's actually in effect right now - separate from the proposals
     list above, so the UI can show 'proposed' vs 'currently active' as
     two clearly distinct states."""
@@ -55,7 +57,8 @@ class RunBatchJobRequest(BaseModel):
 
 
 @router.post("/run-batch-job")
-def run_batch_job(payload: RunBatchJobRequest, db: Session = Depends(get_db)):
+def run_batch_job(payload: RunBatchJobRequest, db: Session = Depends(get_db),
+                   _auth=Depends(require_admin)):
     """Manually triggers the weekly batch job (Phase 9) - in production
     this runs on a schedule; exposed here so the UI/demo doesn't need to
     wait a week to see a proposal appear."""
@@ -66,13 +69,20 @@ def run_batch_job(payload: RunBatchJobRequest, db: Session = Depends(get_db)):
 
 
 class DecisionRequest(BaseModel):
-    decided_by: str
+    pass  # decided_by removed - see accept_proposal/reject_proposal below for why
 
 
 @router.post("/{proposal_id}/accept")
-def accept_proposal(proposal_id: str, payload: DecisionRequest, db: Session = Depends(get_db)):
+def accept_proposal(proposal_id: str, payload: DecisionRequest, db: Session = Depends(get_db),
+                     current_key: CurrentPrincipal = Depends(require_admin)):
+    # decided_by derived from the AUTHENTICATED key, not a client-
+    # supplied string — a real audit finding: this endpoint previously
+    # trusted whatever name the caller typed in, meaning anyone could
+    # widen the system's own auto-execution authority and have the
+    # audit trail record it as approved by any named business owner
+    # they chose.
     try:
-        override = accept_threshold_proposal(db, proposal_id, accepted_by=payload.decided_by)
+        override = accept_threshold_proposal(db, proposal_id, accepted_by=f"admin:{current_key.name}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"cluster_key": override.cluster_key, "active_threshold": override.active_threshold,
@@ -80,9 +90,10 @@ def accept_proposal(proposal_id: str, payload: DecisionRequest, db: Session = De
 
 
 @router.post("/{proposal_id}/reject")
-def reject_proposal(proposal_id: str, payload: DecisionRequest, db: Session = Depends(get_db)):
+def reject_proposal(proposal_id: str, payload: DecisionRequest, db: Session = Depends(get_db),
+                     current_key: CurrentPrincipal = Depends(require_admin)):
     try:
-        proposal = reject_threshold_proposal(db, proposal_id, rejected_by=payload.decided_by)
+        proposal = reject_threshold_proposal(db, proposal_id, rejected_by=f"admin:{current_key.name}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"id": proposal.id, "status": proposal.status}
