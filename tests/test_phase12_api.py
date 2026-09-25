@@ -10,6 +10,43 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+_TEST_DOC_PREFIXES = ("TEST-", "REUPLOAD-TEST")
+
+
+def _purge_test_policy_docs():
+    """The policy-upload tests below write test doc ids into the SHARED
+    data/reindex_state.json and the local Qdrant store and never removed
+    them. The next run then saw those ids as "unchanged", skipped
+    embedding, and found 0 chunks - so these tests passed on a fresh
+    checkout and failed on every run after. Purged before and after each
+    test; real policy documents are never touched."""
+    import json
+    state_path = os.path.join("data", "reindex_state.json")
+    if not os.path.exists(state_path):
+        return
+    with open(state_path) as f:
+        state = json.load(f)
+    test_ids = [k for k in state if k.upper().startswith(_TEST_DOC_PREFIXES)]
+    if not test_ids:
+        return
+    try:
+        from app.core.config import get_settings
+        from app.rag.vectorstore import get_qdrant_client
+        from qdrant_client.models import Filter, FieldCondition, MatchValue, FilterSelector
+        client = get_qdrant_client()
+        collection = get_settings().qdrant_collection
+        if client.collection_exists(collection):
+            for doc_id in test_ids:
+                client.delete(collection_name=collection, points_selector=FilterSelector(
+                    filter=Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))])))
+    except Exception:
+        pass  # a missing collection just means there are no stale points to remove
+    for doc_id in test_ids:
+        state.pop(doc_id, None)
+    with open(state_path, "w") as f:
+        json.dump(state, f, indent=2)
+
+
 @pytest.fixture
 def client_and_db():
     tmp_db = os.path.join(tempfile.gettempdir(), f"test_phase12_{os.getpid()}_{id(object())}.db")
@@ -36,8 +73,10 @@ def client_and_db():
     import app.main as main_module
     importlib.reload(main_module)
 
+    _purge_test_policy_docs()
     with TestClient(main_module.app) as client:
         yield client, db_module
+    _purge_test_policy_docs()
 
     try:
 

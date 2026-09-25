@@ -25,6 +25,28 @@ from app.agents.llm_client import BaseLLMClient, DiagnosisStepPlan
 from app.core.tracing import record_tool_call
 from app.tools import oms, wms, payment, carrier as carrier_tool
 
+# Order fields the planner may see. Identifiers that link to a person or
+# a payment instrument (customer_id, payment_intent_id,
+# payment_fingerprint, payment_method_breakdown) used to be sent to a
+# third-party LLM on every step; the planner doesn't need them to decide
+# what to check next. Redaction applies only to what the LLM sees - the
+# rules and audit trail still get the full findings.
+_LLM_ORDER_FIELDS = ("order_id", "channel", "status", "total_amount_usd", "purchase_date", "line_items")
+_LLM_PAYMENT_FIELDS = ("status", "amount", "unavailable", "note", "error")
+
+
+def _llm_view(findings: dict) -> dict:
+    view = {}
+    for key, value in findings.items():
+        if key == "order" and isinstance(value, dict):
+            view[key] = {k: value[k] for k in _LLM_ORDER_FIELDS if k in value} if "error" not in value else value
+        elif key == "payment" and isinstance(value, dict):
+            view[key] = {k: value[k] for k in _LLM_PAYMENT_FIELDS if k in value}
+        else:
+            view[key] = value
+    return view
+
+
 _VALID_ACTIONS = frozenset({"check_order", "check_payment", "check_inventory", "check_carrier", "conclude"})
 
 
@@ -67,7 +89,12 @@ def _fetch_inventory(db: Session, line_items: list, case_id: str = None) -> list
         stock = record_tool_call(db, case_id or item["sku"], "wms.get_stock", False, get_stock_cached, db, item["sku"])
         total_sellable = sum(s["sellable_qty"] for s in stock)
         total_on_hand = sum(s["on_hand_qty"] for s in stock)
-        results.append({"sku": item["sku"], "sellable_qty": total_sellable, "on_hand_qty": total_on_hand})
+        requested = item.get("qty", 1)
+        # requested_qty/sufficient are stated explicitly: the live-LLM eval
+        # showed the real model reporting "no_anomaly" for 1 sellable vs 3
+        # ordered when it had to cross-reference the order's line items.
+        results.append({"sku": item["sku"], "requested_qty": requested, "sellable_qty": total_sellable,
+                        "on_hand_qty": total_on_hand, "sufficient": total_sellable >= requested})
     return results
 
 
@@ -92,8 +119,19 @@ def run_diagnosis(
     wall_clock_timeout_seconds: float = 30.0,
     case_id: str = None,
     carrier: str = None,
+    exception_type: str = None,
+    prefetch_evidence: bool | None = None,
 ) -> DiagnosisResult:
-    """Runs the iterative diagnosis loop. case_context passed to the LLM
+    """Runs the iterative diagnosis loop.
+
+    prefetch_evidence (default: settings.diagnosis_prefetch_evidence):
+    fetch order, payment, inventory and carrier data BEFORE the first
+    planning step, so the model interprets complete evidence instead of
+    deciding what to look at. Found necessary by the live-LLM eval: the
+    real model concluded "no anomaly" on a stock shortfall in 0/2 runs
+    because it never ran check_inventory on a paid return - no prompt
+    wording fixes evidence that was never collected. The loop still runs
+    afterwards, so the model can conclude or (in principle) re-check. case_context passed to the LLM
     planner is intentionally thin (just order_id) - the planner discovers
     what it needs by requesting checks, not by being handed everything
     upfront; that's what makes this a genuine plan-execute-replan loop
@@ -101,7 +139,11 @@ def run_diagnosis(
     start_time = time.monotonic()
     findings = {}
     steps_taken = []
+    # Why the case was opened (payment / return / carrier ...). Without it
+    # the planner had to guess the goal from the order alone.
     case_context = {"order_id": order_id}
+    if exception_type:
+        case_context["exception_type"] = exception_type
     planner_failures = 0
 
     # Short-term, per-case working memory (app/memory/summary_buffer.py,
@@ -145,6 +187,15 @@ def run_diagnosis(
                 logging.getLogger("diagnosis_agent").warning(
                     "persist_buffer_state failed (non-fatal): %s", e)
 
+    if prefetch_evidence is None:
+        from app.core.config import get_settings
+        prefetch_evidence = get_settings().diagnosis_prefetch_evidence
+    if prefetch_evidence:
+        # Logged to working memory, not steps_taken: steps count only the
+        # model's own planning decisions (max_steps bounds those).
+        _prefetch(db, findings, order_id, payment_intent_id, tracking_number, case_id, carrier,
+                  lambda entry: buffer.add({"agent": entry["action"], "summary": entry["reasoning"]}))
+
     for step_num in range(1, max_steps + 1):
         elapsed = time.monotonic() - start_time
         if elapsed > wall_clock_timeout_seconds:
@@ -155,7 +206,7 @@ def run_diagnosis(
             )
 
         try:
-            plan = llm.plan_next_diagnosis_step(case_context, findings)
+            plan = llm.plan_next_diagnosis_step(case_context, _llm_view(findings))
             planner_failures = 0
         except Exception as e:
             # LLM outage, open circuit, or unparseable output. Previously
@@ -281,6 +332,45 @@ def run_diagnosis(
         steps_taken=steps_taken, terminated_reason="max_steps_reached",
         case_summary=buffer.get_context(),
     )
+
+
+def _prefetch(db, findings, order_id, payment_intent_id, tracking_number, case_id, carrier, record) -> None:
+    """Fills findings with every check that has a data source, using the
+    same fetch helpers (and tracing) as the planner-driven checks. Runs
+    sequentially: the helpers share one DB session, which is not
+    thread-safe. A check with no data source gets the explicit
+    'unavailable' placeholder so the model doesn't read absence as a fault."""
+    unavailable = {"unavailable": True,
+                   "note": "No data source exists for this check on this order. This is NOT evidence of a fault."}
+    fetched = []
+    try:
+        order = _fetch_order(db, order_id, case_id=case_id)
+        findings["order"] = order if order else {"error": "order not found"}
+    except Exception as e:
+        findings["order"] = {"error": str(e)}
+    fetched.append("order")
+    if payment_intent_id:
+        try:
+            findings["payment"] = _fetch_payment(payment_intent_id, db=db, case_id=case_id)
+        except Exception as e:
+            findings["payment"] = {"error": str(e)}
+    else:
+        findings["payment"] = dict(unavailable)
+    line_items = findings["order"].get("line_items", []) if isinstance(findings["order"], dict) else []
+    if line_items:
+        try:
+            findings["inventory"] = _fetch_inventory(db, line_items, case_id=case_id)
+        except Exception as e:
+            findings["inventory"] = {"error": str(e)}
+    if tracking_number:
+        try:
+            findings["carrier"] = _fetch_carrier(tracking_number, db=db, case_id=case_id, carrier=carrier)
+        except Exception as e:
+            findings["carrier"] = {"error": str(e)}
+    else:
+        findings["carrier"] = dict(unavailable)
+    record({"step": 0, "action": "prefetch_evidence",
+            "reasoning": f"collected {sorted(findings)} before planning"})
 
 
 def run_parallel_initial_fanout(db: Session, order: dict, payment_intent_id: str,

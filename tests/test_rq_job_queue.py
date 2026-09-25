@@ -54,7 +54,7 @@ def _run_worker_burst():
     from app.workers.job_queue import RQJobQueue
 
     conn = redis_lib.from_url("redis://localhost:6379/0")
-    worker = SimpleWorker([RQJobQueue.QUEUE_NAME], connection=conn)
+    worker = SimpleWorker([RQJobQueue.FAST_QUEUE_NAME, RQJobQueue.QUEUE_NAME], connection=conn)
     worker.work(burst=True)
 
 def test_get_job_queue_returns_rq_backed_instance_when_redis_configured(rq_settings):

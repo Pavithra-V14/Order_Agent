@@ -374,3 +374,102 @@ def test_R5_reconciler_escalates_a_case_stuck_in_diagnosing(env):
     assert "case-rc3" in summary["case_ids"]["escalated"]
     assert case.state == env.CaseState.ESCALATED
     assert case.resolution_decision["requires_human_review"] is True
+
+
+# ---------------------------------------------------------------- R12 lanes
+def test_R12_fast_lane_is_not_blocked_by_a_running_pipeline():
+    import threading
+    from app.workers.job_queue import InProcessJobQueue, JobStatus
+    q = InProcessJobQueue(slow_workers=1)
+    gate = threading.Event()
+    q.register_handler("process_oms_webhook", lambda p: (gate.wait(5), {"slow": True})[1])
+    q.register_handler("process_inventory_webhook", lambda p: {"fast": True})
+    q.start_worker()
+    try:
+        slow = q.enqueue("process_oms_webhook", {})
+        fast = q.enqueue("process_inventory_webhook", {})
+        assert q.wait_for_job(fast, timeout=2).status == JobStatus.SUCCEEDED
+        assert q.get_job(slow).status == JobStatus.RUNNING      # still inside the "pipeline"
+    finally:
+        gate.set()
+        q.stop_worker()
+
+
+def test_R12_concurrent_duplicate_webhooks_open_one_case(env, monkeypatch):
+    import threading
+    from app.workers import handlers
+    _seed(env, "ORD-R12", 20.0, "pi_r12").close()
+    monkeypatch.setattr(handlers, "_run_pipeline_for_new_case", lambda *a, **k: None)
+    start = threading.Barrier(4)
+
+    def deliver():
+        start.wait()
+        handlers.handle_oms_webhook({"order_id": "ORD-R12", "new_status": "return_requested"})
+
+    threads = [threading.Thread(target=deliver) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    db = env.SessionLocal()
+    assert db.query(env.ExceptionCase).filter_by(order_id="ORD-R12").count() == 1
+
+
+# ---------------------------------------------------------------- R13 data minimisation
+def test_R13_planner_gets_case_type_but_no_payment_or_customer_identifiers(env):
+    from app.agents.diagnosis_agent import run_diagnosis
+    seen = []
+
+    class RecordingLLM(BaseLLMClient):
+        def plan_next_diagnosis_step(self, case_context, findings_so_far):
+            seen.append((dict(case_context), findings_so_far))
+            if "order" not in findings_so_far:
+                return DiagnosisStepPlan(action="check_order", reasoning="need the order")
+            if "payment" not in findings_so_far:
+                return DiagnosisStepPlan(action="check_payment", reasoning="verify payment")
+            return DiagnosisStepPlan(action="conclude", reasoning="done",
+                                     root_causes=["no_anomaly_detected: fine"])
+
+        def assess_fraud_risk(self, case_context, customer_risk_profile):
+            return {"risk_score": 0.0, "flag": False, "reasons": []}
+
+    db = _seed(env, "ORD-R13", 30.0, "pi_r13")
+    result = run_diagnosis(db, RecordingLLM(), order_id="ORD-R13", payment_intent_id="pi_r13",
+                           case_id="case-r13", exception_type="return")
+    assert result.terminated_reason == "concluded"
+    assert all(ctx.get("exception_type") == "return" for ctx, _ in seen)
+    sent = repr([f for _, f in seen])
+    for secret in ("pi_r13", "CUST-ORD-R13", "payment_fingerprint", "payment_method_breakdown"):
+        assert secret not in sent, secret
+    assert result.findings["order"]["payment_intent_id"] == "pi_r13"   # rules/audit still see everything
+
+
+def test_R5_reconciler_scheduler_runs_passes_on_its_own(env):
+    import time
+    from app.workers.reconciler import ReconcilerScheduler
+    s = ReconcilerScheduler(interval_seconds=0.05)
+    s.start()
+    try:
+        deadline = time.monotonic() + 5
+        while s.passes < 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
+    finally:
+        s.stop()
+    assert s.passes >= 2
+
+
+def test_no_anomaly_contradicted_by_tool_data_goes_to_a_human():
+    """Found by the live-LLM eval: the real model said 'no anomaly' on a
+    stock shortfall; the rules then took the return-window refund path."""
+    from datetime import date, timedelta
+    from app.agents.resolution_policy_workflow import propose_resolution_decision
+    common = dict(diagnosis_root_causes=["no_anomaly_detected: all checks passed"], order_amount_usd=30.0,
+                  retrieved_policy_doc_id="RET-POLICY-2025-A", product_category="apparel",
+                  purchase_date=(date.today() - timedelta(days=5)).isoformat(),
+                  return_window_days_by_category={"apparel": 180})
+    d = propose_resolution_decision(inventory_result={"any_shortfall": True}, **common)
+    assert d.requires_human_review and "shortfall" in d.reasoning
+    d = propose_resolution_decision(inventory_result={"any_shortfall": False}, payment_status="requires_payment_method", **common)
+    assert d.requires_human_review
+    d = propose_resolution_decision(inventory_result={"any_shortfall": False}, payment_status="succeeded", **common)
+    assert d.action.value == "refund" and not d.requires_human_review

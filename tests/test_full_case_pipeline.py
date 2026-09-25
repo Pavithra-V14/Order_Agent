@@ -60,6 +60,7 @@ def isolated_qdrant_with_real_policies():
     vectorstore_module._client_singleton_key = None
 
     import app.rag.ingestion as ingestion_module
+    original_reindex_state = ingestion_module._REINDEX_STATE_PATH
     ingestion_module._REINDEX_STATE_PATH = tmp_reindex_state
     from app.rag.ingestion import ingest_policy_directory
     ingest_policy_directory("data/policies")
@@ -72,9 +73,17 @@ def isolated_qdrant_with_real_policies():
     vectorstore_module._client_singleton_key = None
     os.environ.pop("QDRANT_LOCAL_PATH", None)
     get_settings.cache_clear()
+    # Restore the real path - previously left pointing at this deleted temp
+    # file for every later test in the session.
+    ingestion_module._REINDEX_STATE_PATH = original_reindex_state
     shutil.rmtree(tmp_qdrant, ignore_errors=True)
-    if os.path.exists(tmp_reindex_state):
-        os.remove(tmp_reindex_state)
+    try:
+        if os.path.exists(tmp_reindex_state):
+            os.remove(tmp_reindex_state)
+    except PermissionError:
+        # Windows: a sampled Tier 3 judge job (15% of auto-executed cases)
+        # can still be reading this file on the worker thread.
+        pass
 
 
 @pytest.fixture(autouse=True)

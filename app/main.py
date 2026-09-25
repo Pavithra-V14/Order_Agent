@@ -75,7 +75,15 @@ async def lifespan(app: FastAPI):
         import logging
         logging.getLogger("startup").warning("ensure_collection at startup failed (non-fatal): %s", e)
 
+    reconciler = None
+    if get_settings().reconciler_interval_seconds > 0:
+        from app.workers.reconciler import ReconcilerScheduler
+        reconciler = ReconcilerScheduler(get_settings().reconciler_interval_seconds)
+        reconciler.start()
+
     yield
+    if reconciler is not None:
+        reconciler.stop()
     get_job_queue().stop_worker()
 
 

@@ -195,6 +195,17 @@ class Settings(BaseSettings):
     # Fraud score at or above this is a flag, whatever the model says.
     fraud_flag_threshold: float = 0.60
 
+    # Parallel case-pipeline workers for the in-process job queue's slow
+    # lane (webhook -> diagnosis -> decision). The fast lane always has
+    # its own worker.
+    job_queue_slow_workers: int = 2
+    # Collect order/payment/inventory/carrier evidence before the diagnosis
+    # model's first step (app/agents/diagnosis_agent.py::_prefetch).
+    diagnosis_prefetch_evidence: bool = True
+    # Seconds between in-process reconciler passes (app/workers/reconciler.py).
+    # 0 = off; enable on ONE instance, or schedule POST /admin/reconcile.
+    reconciler_interval_seconds: float = 0.0
+
     # --- Rollback switch (Phase 16) ---
     auto_execution_enabled: bool = True
 

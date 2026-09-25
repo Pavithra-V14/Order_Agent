@@ -55,15 +55,23 @@ def main():
         "process_oms_webhook": handlers.handle_oms_webhook,
         "process_inventory_webhook": handlers.handle_inventory_webhook,
         "process_carrier_webhook": handlers.handle_carrier_webhook,
+        "tier3_judge_sample": handlers.handle_tier3_judge_sample,
+        "log_episode": handlers.handle_log_episode,
+        "log_cross_customer_signal": handlers.handle_log_cross_customer_signal,
         # process_policy_upload was removed: policy ingestion now runs
         # SYNCHRONOUSLY inside the upload HTTP request itself (see
         # app/api/v1/policies.py's docstring for why) — it never goes
         # through the job queue at all anymore, so there's no handler
         # to register for it here.
     }
-    print(f"Starting RQ worker for queue '{RQJobQueue.QUEUE_NAME}', handlers: {list(handler_map)}")
+    # Fast lane listed first: RQ drains queues in the order given, so
+    # housekeeping jobs never wait behind a case pipeline. For real
+    # parallelism run several of these processes (one per core) - or a
+    # dedicated fast-lane worker with `--fast-only`.
+    queues = [RQJobQueue.FAST_QUEUE_NAME] if "--fast-only" in sys.argv else [RQJobQueue.FAST_QUEUE_NAME, RQJobQueue.QUEUE_NAME]
+    print(f"Starting RQ worker for queues {queues}, handlers: {list(handler_map)}")
 
-    worker = SimpleWorker([RQJobQueue.QUEUE_NAME], connection=redis_conn)
+    worker = SimpleWorker(queues, connection=redis_conn)
     worker.work()
 
 

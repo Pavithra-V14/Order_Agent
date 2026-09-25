@@ -169,6 +169,54 @@ def run_reconciliation(db: Session | None = None, stale_after_minutes: float = 3
             db.close()
 
 
+class ReconcilerScheduler:
+    """Runs run_reconciliation() every `interval_seconds` on a daemon
+    thread inside the API process. Off unless RECONCILER_INTERVAL_SECONDS
+    > 0 - enable it on exactly ONE instance (or use cron against
+    POST /admin/reconcile instead). A failing pass is logged and alerted,
+    never allowed to kill the loop."""
+
+    def __init__(self, interval_seconds: float):
+        import threading
+        self.interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._thread = None
+        self.passes = 0
+
+    def start(self) -> None:
+        import threading
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="reconciler")
+        self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout)
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            try:
+                summary = run_reconciliation()
+                self.passes += 1
+                if any(summary.get(k) for k in ("retried", "verified", "rerun", "escalated", "errors")):
+                    logger.info("reconciler pass: %s", {k: v for k, v in summary.items() if k != "case_ids"})
+            except Exception as e:
+                logger.exception("reconciler pass failed")
+                try:
+                    from app.core.db import SessionLocal
+                    from app.core.alerting import send_alert
+                    db = SessionLocal()
+                    try:
+                        send_alert(db, "reconciler_failure", {"error": str(e)})
+                    finally:
+                        db.close()
+                except Exception:
+                    pass
+
+
 if __name__ == "__main__":
     import json
     from app.core.db import init_db

@@ -6,6 +6,7 @@ registered against a job_type in app.workers.job_queue.
 """
 from __future__ import annotations
 
+import threading
 import uuid
 
 from app.core.db import ExceptionCase, CaseState, AuditLogEntry
@@ -37,6 +38,18 @@ def _get_session():
 
 
 _OPEN_STATES_EXCLUDED = (CaseState.RESOLVED,)
+
+
+_order_locks: dict[str, threading.Lock] = {}
+_order_locks_guard = threading.Lock()
+
+
+def _order_lock(order_id: str) -> threading.Lock:
+    """Serializes find-or-create for one order within this process, so two
+    parallel slow-lane workers handling a duplicate delivery can't both
+    see "no open case" and both open one."""
+    with _order_locks_guard:
+        return _order_locks.setdefault(order_id, threading.Lock())
 
 
 def _claim_webhook_event(db, event_id: str | None, source: str) -> bool:
@@ -113,13 +126,14 @@ def handle_oms_webhook(payload: dict) -> dict:
         existing_case_id = None
         if new_status in _EXCEPTION_TRIGGERING_STATUSES:
             exception_type = _EXCEPTION_TYPE_BY_STATUS[new_status]
-            existing = _find_open_case(db, order_id, exception_type)
-            if existing is not None:
-                existing_case_id = existing.id
-            else:
-                case_id = _create_case_if_needed(db, order_id, exception_type=exception_type)
-                if case_id is not None:
-                    pipeline_outcome = _run_pipeline_for_new_case(db, case_id, order_id)
+            with _order_lock(order_id):
+                existing = _find_open_case(db, order_id, exception_type)
+                if existing is not None:
+                    existing_case_id = existing.id
+                else:
+                    case_id = _create_case_if_needed(db, order_id, exception_type=exception_type)
+            if case_id is not None:
+                pipeline_outcome = _run_pipeline_for_new_case(db, case_id, order_id)
 
         return {
             "order_id": order_id, "new_status": new_status, "case_created": case_id,
@@ -255,7 +269,8 @@ def handle_carrier_webhook(payload: dict) -> dict:
     if payload.get("order_id") and payload["new_status"] in ("delivery_exception", "lost"):
         db = _get_session()
         try:
-            case_id = _create_case_if_needed(db, payload["order_id"], exception_type="carrier")
+            with _order_lock(payload["order_id"]):
+                case_id = _create_case_if_needed(db, payload["order_id"], exception_type="carrier")
             result["case_created"] = case_id
             # Previously the case was created and left in DETECTED forever -
             # nothing ran diagnosis for carrier-originated cases.

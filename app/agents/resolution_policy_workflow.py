@@ -149,6 +149,20 @@ def propose_resolution_decision(
     if has_no_anomaly and (has_inventory_issue or has_carrier_issue or has_payment_issue):
         return _needs_human("the diagnosis reported both 'no anomaly' and a specific fault, "
                             "which contradict each other.")
+    # 'No anomaly' must also agree with the tool data itself - the live-LLM
+    # eval caught the real model saying "no anomaly" on a stock shortfall
+    # that the inventory agent had detected, which would otherwise have
+    # gone down the return-window refund path.
+    if has_no_anomaly:
+        contradictions = []
+        if any_shortfall:
+            contradictions.append("the inventory check found a stock shortfall")
+        if payment_status not in (None, "succeeded"):
+            contradictions.append(f"the payment gateway reports status {payment_status!r}")
+        if carrier_evidence:
+            contradictions.append("the carrier reports a delivery fault")
+        if contradictions:
+            return _needs_human(f"the diagnosis reported no anomaly, but {' and '.join(contradictions)}.")
     if has_payment_issue and payment_status == "succeeded":
         return _needs_human("the diagnosis reported a payment issue, but the payment gateway "
                             "confirms the charge succeeded; the claimed issue is not supported "

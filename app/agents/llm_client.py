@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 # Bump the version whenever a prompt's text changes, so traces and evals
 # can attribute a behaviour change to the prompt that caused it.
-PROMPT_VERSIONS = {"diagnosis": "diagnosis@2", "fraud": "fraud@1", "summary": "summary@1"}
+PROMPT_VERSIONS = {"diagnosis": "diagnosis@4", "fraud": "fraud@1", "summary": "summary@1"}
 
 # The case the current LLM call belongs to. Set by the orchestrator nodes;
 # when unset (a direct call outside a case) no span is recorded.
@@ -93,6 +93,8 @@ def _diagnosis_system_prompt() -> str:
     return (
         "You are the Diagnosis Agent for an order-exception resolution system. Given the "
         "case context and findings gathered so far, decide the NEXT single action to take. "
+        "case_context.exception_type (when present) says why the case was opened - payment, "
+        "return or carrier - so prioritise the checks relevant to it. "
         "Valid actions: check_order, check_payment, check_inventory, check_carrier, conclude. "
         "CRITICAL: never choose an action whose corresponding key already exists in "
         "findings_so_far (e.g. if findings_so_far already has a 'carrier' key, do NOT choose "
@@ -103,7 +105,11 @@ def _diagnosis_system_prompt() -> str:
         "an entry in findings_so_far, you MUST choose 'conclude' — do not re-request a check "
         "just to double-check or confirm data you already have. "
         "Only choose 'conclude' once you have enough evidence to state root causes (or state "
-        "'no_anomaly_detected: ...' if nothing is wrong). Respond ONLY with JSON: "
+        "'no_anomaly_detected: ...' if nothing is wrong). Before concluding no_anomaly_detected, "
+        "verify ALL of: the payment status is 'succeeded' (or payment is unavailable); every "
+        "inventory item has \"sufficient\": true; the carrier status (if any) is not a fault such "
+        "as lost, damaged or returned_to_sender. If any of these fails, report the matching issue "
+        "(payment_issue / inventory_issue / carrier_issue) instead. Respond ONLY with JSON: "
         '{"action": str, "reasoning": str, "root_causes": [str] or null}. '
         "Each root cause MUST start with one of these exact prefixes — this contract is "
         "required by the calling system, not a style preference: payment_issue:, "

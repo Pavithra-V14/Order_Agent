@@ -87,6 +87,7 @@ def make_diagnosis_node(llm: BaseLLMClient):
                 tracking_number=state.get("tracking_number"),
                 case_id=state["case_id"],
                 carrier=state.get("carrier"),
+                exception_type=getattr(db.get(ExceptionCase, state["case_id"]), "exception_type", None),
             )
             db.add(AuditLogEntry(
                 case_id=state["case_id"], actor="diagnosis_agent", action="diagnosis_complete",
