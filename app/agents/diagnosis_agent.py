@@ -25,6 +25,8 @@ from app.agents.llm_client import BaseLLMClient, DiagnosisStepPlan
 from app.core.tracing import record_tool_call
 from app.tools import oms, wms, payment, carrier as carrier_tool
 
+_VALID_ACTIONS = frozenset({"check_order", "check_payment", "check_inventory", "check_carrier", "conclude"})
+
 
 @dataclass
 class DiagnosisResult:
@@ -100,13 +102,14 @@ def run_diagnosis(
     findings = {}
     steps_taken = []
     case_context = {"order_id": order_id}
+    planner_failures = 0
 
     # Short-term, per-case working memory (app/memory/summary_buffer.py,
     # architecture doc 8.4's Summary Buffer) — found fully implemented
     # but never actually called from anywhere during a direct audit.
     # Reset at the start of every diagnosis run so a reopened case
     # doesn't inherit a stale summary from a previous, unrelated run.
-    from app.memory.summary_buffer import get_or_create_buffer
+    from app.memory.summary_buffer import get_or_create_buffer, persist_buffer_state
     buffer = get_or_create_buffer(case_id or order_id)
     buffer.verbatim_items.clear()
     buffer.running_summary = ""
@@ -117,7 +120,30 @@ def run_diagnosis(
         # SummaryBuffer._summarize) - mapped from this loop's own
         # action/reasoning shape here rather than changing steps_taken's
         # existing, already-tested shape everywhere else in this file.
-        buffer.add({"agent": entry.get("action", "unknown"), "summary": entry.get("reasoning", "")})
+        # Stage 2 memory upgrade: `llm` (this function's own, already-
+        # selected client) is threaded through so folding uses a real
+        # summarize_context() call when a real client is configured -
+        # no separate client construction, no client-selection drift
+        # from what the rest of this diagnosis run is already using.
+        buffer.add({"agent": entry.get("action", "unknown"), "summary": entry.get("reasoning", "")}, llm=llm)
+        # Stage 2 memory upgrade: persists the buffer's CURRENT state
+        # after every step, not just at the end - so a genuine process
+        # crash mid-loop leaves a real, inspectable last-known state on
+        # the case row rather than silently losing it (see
+        # persist_buffer_state()'s own docstring for what this does and
+        # does not guarantee). Non-fatal by construction: a case_id with
+        # no matching ExceptionCase row (common in direct run_diagnosis()
+        # tests/callers) is a documented no-op, not an error, and this
+        # is wrapped besides in case a DB hiccup occurs mid-loop -a
+        # persistence failure must never abort an otherwise-successful
+        # diagnosis step.
+        if db is not None and case_id is not None:
+            try:
+                persist_buffer_state(db, case_id, buffer)
+            except Exception as e:
+                import logging
+                logging.getLogger("diagnosis_agent").warning(
+                    "persist_buffer_state failed (non-fatal): %s", e)
 
     for step_num in range(1, max_steps + 1):
         elapsed = time.monotonic() - start_time
@@ -128,12 +154,40 @@ def run_diagnosis(
                 case_summary=buffer.get_context(),
             )
 
-        plan = llm.plan_next_diagnosis_step(case_context, findings)
+        try:
+            plan = llm.plan_next_diagnosis_step(case_context, findings)
+            planner_failures = 0
+        except Exception as e:
+            # LLM outage, open circuit, or unparseable output. Previously
+            # this propagated and failed the whole case, leaving it stuck
+            # in DIAGNOSING. Two consecutive failures end the loop as
+            # INCOMPLETE, which the rules always route to a human.
+            planner_failures += 1
+            _record_step({"step": step_num, "action": "planner_error",
+                          "reasoning": f"{type(e).__name__}: {str(e)[:200]}"})
+            if planner_failures >= 2:
+                return DiagnosisResult(
+                    findings=findings,
+                    root_causes=[f"diagnosis_incomplete: planner unavailable ({type(e).__name__})"],
+                    steps_taken=steps_taken, terminated_reason="planner_error",
+                    case_summary=buffer.get_context(),
+                )
+            continue
+
+        if plan.action not in _VALID_ACTIONS:
+            _record_step({"step": step_num, "action": "invalid_action",
+                          "reasoning": f"planner returned unknown action {plan.action!r}; ignored"})
+            continue
 
         if plan.action == "conclude":
             _record_step({"step": step_num, "action": "conclude", "reasoning": plan.reasoning})
+            causes = plan.root_causes
+            if isinstance(causes, str):
+                causes = [causes]
+            elif not isinstance(causes, list):
+                causes = []
             return DiagnosisResult(
-                findings=findings, root_causes=plan.root_causes or [],
+                findings=findings, root_causes=[str(c) for c in causes],
                 steps_taken=steps_taken, terminated_reason="concluded",
                 case_summary=buffer.get_context(),
             )
@@ -209,7 +263,16 @@ def run_diagnosis(
         # unsatisfiable check; this is what makes the non-converging test
         # case actually terminate via max_steps rather than an infinite
         # identical-action loop hiding the real ceiling test.
-        findings[plan.action] = {"unavailable": True}
+        # Stored under the canonical key ("payment"/"carrier") so the
+        # redundant-check guard above stops a repeat request, with an
+        # explicit note: a real model read the old bare
+        # {"unavailable": True} as "carrier_issue: carrier_unavailable".
+        canonical = _redundant_check_map.get(plan.action, plan.action)
+        findings[canonical] = {
+            "unavailable": True,
+            "note": "No data source exists for this check on this order (e.g. no payment id or "
+                    "tracking number). This is NOT evidence of a fault.",
+        }
         _record_step({"step": step_num, "action": plan.action, "reasoning": plan.reasoning,
                       "note": "no data source available for this check"})
 

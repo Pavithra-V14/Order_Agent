@@ -95,7 +95,10 @@ def test_resolution_workflow_handles_empty_diagnosis_causes_list(isolated_db):
         diagnosis_root_causes=[], inventory_result={}, order_amount_usd=25.0,
     )
     assert decision is not None
-    assert decision.action.value == "refund"
+    # Previously asserted "refund" - an empty diagnosis refunding the order
+    # was the R1 defect. It must now be a no-money, human-review proposal.
+    assert decision.action.value == "deny" and decision.amount_usd == 0.0
+    assert decision.requires_human_review is True
 
 def test_tier2_rejects_completely_empty_decision_dict():
     from app.guardrails.tier2_structural import validate_structure

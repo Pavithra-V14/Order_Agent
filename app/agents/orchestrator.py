@@ -23,7 +23,7 @@ from langgraph.graph import StateGraph, END
 from sqlalchemy.orm import Session
 
 from app.core.db import ExceptionCase, CaseState, AuditLogEntry
-from app.agents.llm_client import BaseLLMClient, get_llm_client
+from app.agents.llm_client import BaseLLMClient, get_llm_client, set_llm_trace, reset_llm_trace
 from app.agents.diagnosis_agent import run_diagnosis, DiagnosisResult
 from app.agents.workflow_agents import run_fraud_risk_agent, run_inventory_agent, run_customer_context_agent
 
@@ -78,6 +78,7 @@ def make_diagnosis_node(llm: BaseLLMClient):
         from app.core.console_log import log_agent_step
         log_agent_step("diagnosis", "starting", case_id=state["case_id"])
         db = SessionLocal()
+        trace_token = set_llm_trace(state["case_id"])
         try:
             result: DiagnosisResult = run_diagnosis(
                 db, llm,
@@ -94,6 +95,7 @@ def make_diagnosis_node(llm: BaseLLMClient):
             ))
             db.commit()
         finally:
+            reset_llm_trace(trace_token)
             db.close()
         log_agent_step("diagnosis", f"root_causes={result.root_causes}", case_id=state["case_id"])
         return {
@@ -110,12 +112,21 @@ def make_fraud_node(llm: BaseLLMClient):
         from app.core.console_log import log_agent_step
         log_agent_step("fraud", "starting", case_id=state["case_id"])
         db = SessionLocal()
+        trace_token = set_llm_trace(state["case_id"])
         try:
             result = run_fraud_risk_agent(
                 db, llm, customer_id=state["customer_id"],
                 address_changed_same_day=state.get("address_changed_same_day", False),
+                # Stage 1 memory upgrade: lets the fraud agent look up
+                # this order's payment_fingerprint and cross-check it
+                # against OTHER customers' fraud history (see
+                # find_related_fraud_signals). Optional/backward
+                # compatible - run_fraud_risk_agent treats a missing
+                # order_id exactly like an order with no fingerprint.
+                order_id=state.get("order_id"),
             )
         finally:
+            reset_llm_trace(trace_token)
             db.close()
         log_agent_step("fraud", f"risk_score={result.get('risk_score')}, flag={result.get('flag')}", case_id=state["case_id"])
         return {"fraud_result": result}
@@ -166,6 +177,64 @@ def make_aggregate_node():
             fraud = state.get("fraud_result", {})
             case.fraud_risk_score = fraud.get("risk_score")
             case.fraud_flag = "flagged" if fraud.get("flag") else None
+            case.fraud_reasons = fraud.get("reasons") or None
+
+            # Stage 1 memory upgrade: a REAL, previously-existing gap
+            # found while wiring the cross-customer fraud query - the
+            # "fraud_flag_raised" episode_type was referenced by
+            # app/memory/episodic.py's counting logic and covered by
+            # app/memory/eval.py's golden set, but nothing in the live
+            # pipeline ever actually WROTE one. summarize_customer_
+            # risk_profile()'s fraud_flags_raised count was therefore
+            # guaranteed to read 0 for every real customer, regardless
+            # of how many fraud flags had actually been raised for them
+            # - the counting logic was correct, but had nothing real to
+            # count. Same non-fatal discipline as resolution_completion
+            # .py's log_episode call: a memory-write failure must never
+            # block the diagnosis pipeline from completing.
+            if fraud.get("flag"):
+                try:
+                    from datetime import datetime, timezone
+                    from app.memory.episodic import log_episode_async
+                    from app.tools.oms import get_order
+                    order = get_order(db, state["order_id"])
+                    log_episode_async(
+                        customer_id=state["customer_id"], episode_type="fraud_flag_raised",
+                        content={
+                            "reason": "; ".join(fraud.get("reasons", [])) or "fraud risk threshold exceeded",
+                            "risk_score": fraud.get("risk_score"),
+                            # Included here too (not just on case_resolved)
+                            # so a customer's VERY FIRST case - not yet
+                            # resolved - is still discoverable by
+                            # find_related_fraud_signals if it's the one
+                            # that happens to carry the shared fingerprint.
+                            "payment_fingerprint": order.get("payment_fingerprint") if order else None,
+                        },
+                        occurred_at=datetime.now(timezone.utc), case_id=state["case_id"],
+                    )
+                    # Follow-up: also feeds the shared cross-customer
+                    # graph, same reasoning as resolution_completion.py's
+                    # identical addition - complementary to, never a
+                    # replacement for, the deterministic fraud check.
+                    fingerprint = order.get("payment_fingerprint") if order else None
+                    if fingerprint:
+                        from app.memory.graphiti_adapter import log_cross_customer_signal_async
+                        log_cross_customer_signal_async(
+                            customer_id=state["customer_id"], signal_type="payment_fingerprint",
+                            signal_value=fingerprint, case_id=state["case_id"],
+                        )
+                except Exception as e:
+                    import logging
+                    logging.getLogger("orchestrator").warning(
+                        "log_episode(fraud_flag_raised) failed (non-fatal): %s", e)
+                    try:
+                        from app.core.alerting import send_alert
+                        send_alert(db, "log_episode_failure", {
+                            "case_id": state["case_id"], "customer_id": state["customer_id"], "error": str(e),
+                        })
+                    except Exception:
+                        pass
+
             db.add(AuditLogEntry(
                 case_id=state["case_id"], actor="orchestrator", action="diagnosis_phase_aggregated",
                 detail={"fraud_result": fraud, "inventory_result": state.get("inventory_result"),
@@ -311,6 +380,21 @@ def run_full_case_pipeline(
                 retrieved_policy_version = retrieval_results[0].metadata.get("version")
                 return_window_days_by_category = retrieval_results[0].metadata.get("return_window_days_by_category")
 
+    from app.core.config import get_settings
+    from app.agents.learning_loop import get_active_threshold
+    settings = get_settings()
+    case_row = db.get(ExceptionCase, case_id)
+    # A human-accepted threshold override for this case's cluster (Phase 9
+    # learning loop) replaces the caller's default. Previously nothing
+    # read the override table, so an accepted proposal had no effect.
+    if case_row is not None:
+        auto_execute_confidence_threshold = get_active_threshold(
+            db, f"{case_row.exception_type}_{case_row.channel}", auto_execute_confidence_threshold)
+    extra_reasons = []
+    if diagnosis_state["fraud_result"].get("degraded"):
+        extra_reasons.append("fraud check ran in degraded mode (LLM unavailable or invalid output) - "
+                             "human review required")
+
     result = run_resolution_policy_workflow(
         diagnosis_root_causes=diagnosis_state["diagnosis_root_causes"],
         inventory_result=diagnosis_state["inventory_result"],
@@ -323,7 +407,10 @@ def run_full_case_pipeline(
         purchase_date=purchase_date,
         product_category=product_category,
         return_window_days_by_category=return_window_days_by_category,
-        payment_status=diagnosis_state.get("diagnosis_findings", {}).get("payment", {}).get("status"),
+        payment_status=(diagnosis_state.get("diagnosis_findings", {}).get("payment") or {}).get("status"),
+        diagnosis_findings=diagnosis_state.get("diagnosis_findings") or {},
+        extra_escalation_reasons=extra_reasons,
+        max_single_action_ceiling_usd=settings.max_single_action_ceiling_usd,
         db=db, case_id=case_id,
     )
 
@@ -353,6 +440,15 @@ def run_full_case_pipeline(
         # ESCALATE or BLOCKED: leave for human review — case.state
         # already reflects this via resolution_policy_workflow's own
         # audit logging; nothing further to execute yet.
-        case.state = CaseState.ESCALATED if result.routing.value == "escalate" else case.state
+        # BLOCKED gets its own state: previously it silently stayed in
+        # DIAGNOSING, a state no queue, page or reconciler looks at.
+        new_state = CaseState.ESCALATED if result.routing.value == "escalate" else CaseState.BLOCKED
+        db.add(AuditLogEntry(case_id=case_id, actor="resolution_policy_workflow", action="state_transition",
+                              detail={"from": case.state.value, "to": new_state.value,
+                                      "routing_reasons": result.routing_reasons}))
+        case.state = new_state
         db.commit()
+        if new_state == CaseState.ESCALATED:
+            from app.agents.resolution_completion import _notify_safely
+            _notify_safely(case.customer_id, "escalated")
         return {"routing": result.routing.value, "diagnosis": diagnosis_state, "completion": None}

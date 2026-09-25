@@ -2,8 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
-from app.core.metrics import compute_agent_metrics, compute_tool_metrics, compute_rag_metrics, compute_system_metrics
+from app.core.metrics import (compute_agent_metrics, compute_tool_metrics, compute_rag_metrics,
+                              compute_system_metrics, compute_llm_metrics)
 from app.core.tracing import get_trace
+from app.core.auth import require_readonly
 
 router = APIRouter(tags=["metrics"])
 
@@ -12,12 +14,13 @@ _SCOPE_FUNCS = {
     "tool": compute_tool_metrics,
     "rag": compute_rag_metrics,
     "system": compute_system_metrics,
+    "llm": compute_llm_metrics,
 }
 
 
 @router.get("/metrics/{scope}")
-def get_metrics(scope: str, db: Session = Depends(get_db)):
-    """scope in {agent, tool, rag, system} - per architecture doc 8.7's
+def get_metrics(scope: str, db: Session = Depends(get_db), _auth=Depends(require_readonly)):
+    """scope in {agent, tool, rag, system, llm} - per architecture doc 8.7's
     metrics categories, each computed live from trace/audit data."""
     fn = _SCOPE_FUNCS.get(scope)
     if fn is None:
@@ -26,7 +29,7 @@ def get_metrics(scope: str, db: Session = Depends(get_db)):
 
 
 @router.get("/traces/{case_id}")
-def get_case_trace(case_id: str, db: Session = Depends(get_db)):
+def get_case_trace(case_id: str, db: Session = Depends(get_db), _auth=Depends(require_readonly)):
     """Full input/output/metadata trace for one case."""
     spans = get_trace(db, case_id)
     if not spans:

@@ -12,11 +12,16 @@ from app.agents.resolution_policy_workflow import run_resolution_policy_workflow
 # THE three core Phase 7 DoD scenarios
 # ---------------------------------------------------------------------------
 def test_case_auto_executable():
-    """Normal, low-value, high-confidence, no fraud flag, valid citation,
-    AND a genuinely succeeded payment (a refund only makes sense when
-    money was actually taken) -> AUTO_EXECUTE."""
+    """Normal, low-value, no fraud flag, valid citation, a plain return
+    inside the policy window on a succeeded payment -> AUTO_EXECUTE.
+    (A "payment_issue" on a SUCCEEDED charge used to auto-refund here; the
+    gateway contradicts that claim, so it now escalates - see
+    tests/test_review_evidence.py::test_R3_*.)"""
+    from datetime import date, timedelta
     result = run_resolution_policy_workflow(
-        diagnosis_root_causes=["payment_issue: duplicate charge detected for this order"],
+        diagnosis_root_causes=["no_anomaly_detected: all checked systems report normal state"],
+        purchase_date=(date.today() - timedelta(days=10)).isoformat(), product_category="apparel",
+        return_window_days_by_category={"apparel": 180, "all": 180},
         inventory_result={"any_shortfall": False},
         order_amount_usd=30.0,
         fraud_flag_present=False,

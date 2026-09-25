@@ -46,10 +46,17 @@ class CircuitBreaker:
                 self._state = CircuitState.HALF_OPEN
         return self._state
 
-    def call(self, fn: Callable[[], T]) -> T:
+    def call(self, fn: Callable[[], T], is_failure: Callable[[Exception], bool] | None = None) -> T:
         """Executes fn() through the breaker. Raises CircuitOpenError
         without calling fn() at all if the circuit is OPEN - this is what
-        "fail fast" actually means, not just "retry a few times and give up." """
+        "fail fast" actually means, not just "retry a few times and give up."
+
+        is_failure: optional predicate. An exception for which it returns
+        False is re-raised WITHOUT counting against the circuit - it says
+        something about the request (e.g. "already refunded"), not about
+        the dependency's health. Without this, one bad request retried
+        three times opened the shared payment circuit and blocked every
+        other customer's refund for 30s (observed against real Stripe)."""
         current_state = self.state
 
         if current_state == CircuitState.OPEN:
@@ -62,7 +69,9 @@ class CircuitBreaker:
         self.call_attempts += 1
         try:
             result = fn()
-        except Exception:
+        except Exception as e:
+            if is_failure is not None and not is_failure(e):
+                raise
             self.call_failures += 1
             self._consecutive_failures += 1
             if self._consecutive_failures >= self.failure_threshold:

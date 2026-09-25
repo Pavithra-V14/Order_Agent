@@ -29,7 +29,9 @@ def test_refund_with_no_payment_intent_id_fails_fast_not_after_three_wasted_retr
         payment_intent_id=None,  # the exact condition that caused the real bug
     )
 
-    assert result.status == ExecutionStatus.PENDING_RETRY
+    # A missing payment is permanent, not transient: FAILED sends the case
+    # to a human instead of the retry queue, where it could never succeed.
+    assert result.status == ExecutionStatus.FAILED
     assert result.attempts_made == 0, (
         "must fail immediately (0 attempts) rather than wasting 3 real retries against a gateway "
         "call that has no payment_intent_id to work with and can never succeed"
@@ -58,6 +60,8 @@ def test_partial_credit_with_no_payment_intent_id_also_fails_fast():
         db, case_id="case-no-payment-intent-test-2", decision=decision, payment_intent_id=None,
     )
 
-    assert result.status == ExecutionStatus.PENDING_RETRY
+    # A missing payment is permanent, not transient: FAILED sends the case
+    # to a human instead of the retry queue, where it could never succeed.
+    assert result.status == ExecutionStatus.FAILED
     assert result.attempts_made == 0
     db.close()

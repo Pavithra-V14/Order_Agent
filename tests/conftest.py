@@ -99,6 +99,18 @@ def pytest_configure(config):
     """
     global _SAVED_CREDENTIAL_ENV_VARS
     _SAVED_CREDENTIAL_ENV_VARS = {var: os.environ.pop(var, None) for var in _CLOUD_CREDENTIAL_ENV_VARS}
+
+    # graphiti_core calls python-dotenv's load_dotenv() at IMPORT time
+    # (graphiti_core/graphiti.py and driver/driver.py). The first test to
+    # import it - anything touching episodic memory - copied the real .env
+    # back into os.environ mid-test, and that test then talked to the REAL
+    # Stripe account (observed: a golden-set scenario's payment lookup hit
+    # api.stripe.com and got "No such payment_intent: 'pi_golden_mc'").
+    # Neutralized for the whole session before anything can import it.
+    import dotenv
+    import dotenv.main
+    dotenv.load_dotenv = lambda *args, **kwargs: False
+    dotenv.main.load_dotenv = dotenv.load_dotenv
     Settings.model_config["env_file"] = None
     from app.core.config import get_settings
     get_settings.cache_clear()

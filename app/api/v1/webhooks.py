@@ -1,7 +1,8 @@
 from pydantic import BaseModel
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.workers.job_queue import get_job_queue
+from app.core.auth import require_service, require_readonly
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
@@ -9,6 +10,8 @@ router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 class OmsWebhookPayload(BaseModel):
     order_id: str
     new_status: str
+    # Provider's delivery id. Redeliveries with the same id are ignored.
+    event_id: str | None = None
 
 
 class InventoryWebhookPayload(BaseModel):
@@ -22,6 +25,7 @@ class CarrierWebhookPayload(BaseModel):
     tracking_number: str
     new_status: str
     order_id: str | None = None
+    event_id: str | None = None
 
 
 class WebhookAckResponse(BaseModel):
@@ -30,7 +34,7 @@ class WebhookAckResponse(BaseModel):
 
 
 @router.post("/oms", response_model=WebhookAckResponse, status_code=status.HTTP_202_ACCEPTED)
-def oms_webhook(payload: OmsWebhookPayload):
+def oms_webhook(payload: OmsWebhookPayload, _auth=Depends(require_service)):
     """Per architecture doc 8.1: 'ack fast, process async' - validates via
     Pydantic and enqueues a job. Does NOT touch the DB or call any tool
     itself - that happens on the worker thread."""
@@ -39,19 +43,19 @@ def oms_webhook(payload: OmsWebhookPayload):
 
 
 @router.post("/inventory", response_model=WebhookAckResponse, status_code=status.HTTP_202_ACCEPTED)
-def inventory_webhook(payload: InventoryWebhookPayload):
+def inventory_webhook(payload: InventoryWebhookPayload, _auth=Depends(require_service)):
     job_id = get_job_queue().enqueue("process_inventory_webhook", payload.model_dump())
     return WebhookAckResponse(job_id=job_id)
 
 
 @router.post("/carrier", response_model=WebhookAckResponse, status_code=status.HTTP_202_ACCEPTED)
-def carrier_webhook(payload: CarrierWebhookPayload):
+def carrier_webhook(payload: CarrierWebhookPayload, _auth=Depends(require_service)):
     job_id = get_job_queue().enqueue("process_carrier_webhook", payload.model_dump())
     return WebhookAckResponse(job_id=job_id)
 
 
 @router.get("/jobs/{job_id}")
-def get_job_status(job_id: str):
+def get_job_status(job_id: str, _auth=Depends(require_readonly)):
     """Practical addition for testing/observing the async contract."""
     job = get_job_queue().get_job(job_id)
     if job is None:

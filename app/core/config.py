@@ -111,6 +111,23 @@ class Settings(BaseSettings):
     graphiti_router_model: str = "openai/gpt-oss-120b"
     reasoning_model: str = "mistral-large-latest"         # Mistral La Plateforme
     generation_model: str = "gemini-2.0-flash"             # Google AI Studio
+    # Multi-provider LLM fallback: found declared (google_api_key,
+    # cohere_api_key above) but NEVER ACTUALLY WIRED into any LLM
+    # client anywhere in this codebase - LiteLLMClient's Router had
+    # exactly one deployment (Groq), so "Available Model Group
+    # Fallbacks=None" on a real Groq rate-limit error was litellm
+    # telling the truth, not a misconfiguration. Fixed by building the
+    # Router's model_list and fallback chain DYNAMICALLY from whichever
+    # of groq_api_key/google_api_key/cohere_api_key are actually
+    # configured (same settings-driven pattern as every other backend
+    # in this project), rather than assuming any one of them is always
+    # present. cohere_generation_model is a plain "command-r-plus" -
+    # verified only that this model name exists in Cohere's product
+    # line as of this project's training data, NOT confirmed against a
+    # live Cohere API call from this sandbox (no network route here) -
+    # check Cohere's current model list if this specific name is ever
+    # deprecated, same honest caveat as graphiti_router_model above.
+    cohere_generation_model: str = "command-r-plus"
 
     # --- Embeddings / Reranker (8.2, 8.10) ---
     # embedding_backend: "mistral" (cloud, default once mistral_api_key is
@@ -162,6 +179,21 @@ class Settings(BaseSettings):
     # --- Guardrail thresholds (Part 5, Phase 1's Architecture Decision Sheet) ---
     auto_execute_confidence_threshold: float = 0.90
     auto_execute_value_ceiling_usd: float = 50.00
+
+    # Absolute Tier 1 ceiling for any single action, automated OR human.
+    max_single_action_ceiling_usd: float = 1000.00
+    # Denials send the customer a "we can't approve this" message; by
+    # default a person confirms every one rather than the rules alone.
+    auto_execute_denials: bool = False
+    # Largest amount a reviewer of each role may approve or edit to, on
+    # top of the Tier 1 ceiling above. Roles not listed may not approve.
+    human_approval_limit_cs_agent_usd: float = 250.00
+    human_approval_limit_admin_usd: float = 1000.00
+    # A webhook for an order+exception type that already had a case
+    # opened within this many hours is treated as a redelivery.
+    webhook_dedupe_window_hours: float = 24.0
+    # Fraud score at or above this is a flag, whatever the model says.
+    fraud_flag_threshold: float = 0.60
 
     # --- Rollback switch (Phase 16) ---
     auto_execution_enabled: bool = True

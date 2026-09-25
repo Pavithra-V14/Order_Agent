@@ -170,7 +170,7 @@ tr:hover td { background: #FAFBFC; }
   white-space: nowrap;
 }
 .badge-detected, .badge-diagnosing, .badge-executing, .badge-verifying { background: var(--state-diagnosing); }
-.badge-escalated { background: var(--state-escalated); }
+.badge-escalated, .badge-pending_retry { background: var(--state-escalated); }
 .badge-resolved { background: var(--state-resolved); }
 .badge-reopened { background: var(--state-reopened); }
 .badge-blocked, .badge-failed { background: var(--state-blocked); }

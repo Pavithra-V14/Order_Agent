@@ -288,3 +288,34 @@ def compute_system_metrics(db: Session) -> dict:
         # no way to know from telemetry alone — not computed here, and
         # deliberately not faked with a placeholder number.
     }
+
+
+def compute_llm_metrics(db: Session) -> dict:
+    """Per-call LLM telemetry from llm.* spans (app/agents/llm_client.py):
+    call volume, failure rate, latency and token usage per model and per
+    prompt version - the numbers needed to spot a model or prompt change
+    that degraded output, and to review cost."""
+    spans = db.query(TraceSpanRecord).filter(TraceSpanRecord.agent_or_tool_name.like("llm.%")).all()
+    groups: dict = {}
+    for s in spans:
+        m = s.span_metadata if isinstance(s.span_metadata, dict) else {}
+        key = (m.get("model") or "unknown", m.get("prompt_version") or s.agent_or_tool_name)
+        g = groups.setdefault(key, {"calls": 0, "failures": 0, "latencies": [], "prompt_tokens": 0,
+                                    "completion_tokens": 0})
+        g["calls"] += 1
+        g["failures"] += 0 if m.get("ok", True) else 1
+        if m.get("latency_ms") is not None:
+            g["latencies"].append(m["latency_ms"])
+        g["prompt_tokens"] += m.get("prompt_tokens") or 0
+        g["completion_tokens"] += m.get("completion_tokens") or 0
+    by_model_prompt = []
+    for (model, prompt_version), g in sorted(groups.items()):
+        lat = sorted(g["latencies"])
+        by_model_prompt.append({
+            "model": model, "prompt_version": prompt_version, "calls": g["calls"],
+            "failure_rate": round(g["failures"] / g["calls"], 3),
+            "avg_latency_ms": round(sum(lat) / len(lat), 1) if lat else None,
+            "p95_latency_ms": lat[int(len(lat) * 0.95)] if lat else None,
+            "prompt_tokens": g["prompt_tokens"], "completion_tokens": g["completion_tokens"],
+        })
+    return {"total_llm_calls": len(spans), "by_model_and_prompt": by_model_prompt}

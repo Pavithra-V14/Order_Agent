@@ -13,7 +13,8 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    Column, String, Float, DateTime, Enum, JSON, ForeignKey, create_engine, Text, Integer, Boolean
+    Column, String, Float, DateTime, Enum, JSON, ForeignKey, create_engine, Text, Integer, Boolean,
+    inspect, text,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
@@ -39,6 +40,8 @@ class CaseState(str, enum.Enum):
     VERIFYING = "verifying"
     RESOLVED = "resolved"
     REOPENED = "reopened"            # edge case 6.3
+    BLOCKED = "blocked"              # Tier 1 rejected the proposal; needs a new proposal, not approval
+    PENDING_RETRY = "pending_retry"  # transient execution failure; the reconciler retries it
 
 
 class ExceptionCase(Base):
@@ -58,9 +61,27 @@ class ExceptionCase(Base):
     diagnosis = Column(JSON, nullable=True)
     fraud_risk_score = Column(Float, nullable=True)
     fraud_flag = Column(String, nullable=True)  # null | "flagged"
+    # Manual-check follow-up: fraud_result["reasons"] previously only
+    # lived in AuditLogEntry.detail (queryable via /audit-log, but not
+    # via the case itself) - stored here too so GET /cases/{id} can
+    # surface WHY a case was flagged, not just the score, without a
+    # second endpoint round-trip.
+    fraud_reasons = Column(JSON, nullable=True)
     resolution_decision = Column(JSON, nullable=True)  # {"action": "refund", "amount": 42.0, "reasoning": "...", "confidence": 0.93, "cited_policy": {...}}
     execution_result = Column(JSON, nullable=True)
     verification_result = Column(JSON, nullable=True)
+    # Stage 2 memory upgrade: durable snapshot of the Summary Buffer's
+    # last known state (app/memory/summary_buffer.py's
+    # SummaryBuffer.get_context() shape - {"case_id", "running_summary",
+    # "recent_items"}). Nullable - a case that never went through
+    # run_diagnosis() (e.g. seeded directly in a test) simply has no
+    # working memory snapshot yet. Persisted so a process restart mid-
+    # diagnosis doesn't silently lose the buffer (previously purely in-
+    # process). Cleared back to None once a case resolves (see
+    # app/agents/resolution_completion.py) - by then the final decision
+    # and the audit log already capture what mattered, so keeping the
+    # working-memory snapshot around past resolution is redundant.
+    working_memory_summary = Column(JSON, nullable=True)
 
     idempotency_key = Column(String, nullable=True, unique=True)  # Layer 5
 
@@ -156,6 +177,18 @@ class AlertRecord(Base):
     created_at = Column(DateTime(timezone=True), default=_now)
 
 
+class WebhookEventRecord(Base):
+    """One row per webhook delivery the provider identified with an
+    event_id. Providers retry deliveries as a matter of course; the
+    primary key makes a redelivery a no-op instead of a second case (and,
+    before this existed, a second refund)."""
+    __tablename__ = "webhook_events"
+
+    event_id = Column(String, primary_key=True)
+    source = Column(String, nullable=False)       # "oms" | "carrier" | "inventory"
+    received_at = Column(DateTime(timezone=True), default=_now)
+
+
 class ApiKeyRecord(Base):
     """Real authentication/authorization: every API key is hashed
     (never stored raw — see app/core/auth.py's hashing, the same
@@ -217,6 +250,14 @@ class MockOrderRecord(Base):
     payment_intent_id = Column(String, nullable=True)  # links to the payment gateway's transaction — needed by the Execution Agent to issue a refund
     total_amount_usd = Column(Float, nullable=False)
     payment_method_breakdown = Column(JSON, nullable=True)  # edge case 2.1: split payment methods
+    # Cross-customer fraud-linking signal (Stage 1 memory upgrade) - a
+    # deterministic hash of card brand + last4 (see
+    # app/tools/oms.py's compute_payment_fingerprint()), NOT a raw card
+    # number. Nullable: orders with no card component (pure gift-card/
+    # store-credit) or seeded without card details simply have no
+    # fingerprint and are excluded from the cross-customer fraud query
+    # (app/memory/graphiti_adapter.py's find_related_fraud_signals).
+    payment_fingerprint = Column(String, nullable=True, index=True)
     purchase_date = Column(DateTime(timezone=True), nullable=False)  # drives temporal policy binding (RAG 8.2.4)
     line_items = Column(JSON, nullable=False)          # [{"sku": ..., "category": ..., "qty": ..., "price": ...}]
     created_at = Column(DateTime(timezone=True), default=_now)
@@ -399,8 +440,84 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_db() -> None:
     """Create tables if they don't exist. Fine for SQLite/dev; use Alembic
-    migrations once this moves to Postgres in staging (documented in a later phase)."""
+    migrations once this moves to Postgres in staging (documented in a later phase).
+
+    REAL GAP FOUND (not theoretical - this broke a real Postgres
+    deployment): create_all() only creates tables that don't exist yet.
+    It never alters an EXISTING table, so adding a new Column to a
+    model that already had a live table (a real, persistent Postgres
+    database this project's own docstring above already warned about)
+    left the ORM model and the actual database schema silently out of
+    sync - every query selecting the new column then fails with
+    UndefinedColumn, on every single code path that touches that table,
+    not just the one that added the column. SQLite/fresh-DB dev and
+    test environments never hit this, because there the table doesn't
+    exist yet either, so create_all() genuinely does create it with
+    every current column - masking the gap until a real, already-
+    running Postgres instance hit it.
+
+    _ensure_new_columns() below is the pragmatic fix given this project
+    deliberately doesn't run Alembic: an idempotent, dialect-agnostic
+    (SQLite and Postgres both) "ALTER TABLE ADD COLUMN IF MISSING" for
+    every column added after a table's original creation. Real Alembic
+    migrations remain the right answer for anything beyond this - this
+    is a stopgap that unblocks an already-running Postgres instance
+    without requiring migration tooling to be stood up first.
+    """
     Base.metadata.create_all(bind=engine)
+    _ensure_new_columns()
+    _ensure_enum_values()
+
+
+def _ensure_enum_values() -> None:
+    """Postgres stores CaseState as a native ENUM type, and create_all()
+    never adds values to an existing type - so a database created before
+    BLOCKED/PENDING_RETRY existed would reject those states. Adds any
+    missing member (SQLAlchemy persists enum NAMES) idempotently. SQLite
+    stores the enum as plain VARCHAR, so this is a no-op there."""
+    if engine.dialect.name != "postgresql":
+        return
+    import logging
+    try:
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            for member in CaseState:
+                conn.execute(text(f"ALTER TYPE casestate ADD VALUE IF NOT EXISTS '{member.name}'"))
+    except Exception as e:
+        logging.getLogger("db").warning("_ensure_enum_values: could not extend casestate enum: %s", e)
+
+
+def _ensure_new_columns() -> None:
+    """Idempotent, dialect-agnostic column-add for columns introduced
+    after their table's original create_all() - see init_db()'s
+    docstring for why this exists. Safe to call every startup: checks
+    via inspect() whether each column already exists before doing
+    anything, so a fresh database (where create_all() above already
+    created the table with every current column) is a no-op here, and
+    an already-existing table missing a newer column gets it added.
+    Each column is independent and wrapped in its own try/except so one
+    failure (e.g. a permissions issue) doesn't block the others."""
+    import logging
+    logger = logging.getLogger("db")
+    inspector = inspect(engine)
+
+    # (table_name, column_name, SQL type - valid in both SQLite and Postgres)
+    columns_to_ensure = [
+        ("mock_orders", "payment_fingerprint", "VARCHAR"),
+        ("exception_cases", "working_memory_summary", "JSON"),
+        ("exception_cases", "fraud_reasons", "JSON"),
+    ]
+    for table_name, column_name, sql_type in columns_to_ensure:
+        try:
+            if table_name not in inspector.get_table_names():
+                continue  # create_all() above will have created it fresh with this column already
+            existing_columns = {col["name"] for col in inspector.get_columns(table_name)}
+            if column_name in existing_columns:
+                continue
+            with engine.begin() as conn:
+                conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {sql_type}"))
+            logger.info("_ensure_new_columns: added missing column %s.%s", table_name, column_name)
+        except Exception as e:
+            logger.warning("_ensure_new_columns: could not ensure %s.%s exists: %s", table_name, column_name, e)
 
 
 def get_db():
