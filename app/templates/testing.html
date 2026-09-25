@@ -7,6 +7,16 @@
 </div>
 
 <div class="panel" style="max-width:640px; margin-bottom:20px;">
+  <h2>Demo Scenarios</h2>
+  <p class="rationale-text">Trigger a realistic end-to-end case — seeds real order/stock/customer data, runs the actual pipeline, and takes you straight to the resulting case. Uses whatever real credentials are actually configured (Stripe, Groq, etc.), same as running these from the command line.</p>
+  <form id="demo-scenario-form" style="display:flex; gap:8px; margin-top:10px;">
+    <select id="demo-scenario-select" style="flex:1;"><option>Loading scenarios...</option></select>
+    <button type="submit" class="primary">Run Scenario</button>
+  </form>
+  <div id="demo-scenario-result" style="margin-top:12px;"></div>
+</div>
+
+<div class="panel" style="max-width:640px; margin-bottom:20px;">
   <h2>Select Scenarios</h2>
   <div id="scenario-checkboxes" class="rationale-text">Loading scenarios...</div>
   <div style="margin:10px 0;">
@@ -232,6 +242,58 @@ document.getElementById('golden-set-run-form').addEventListener('submit', async 
   }
 });
 
+async function loadDemoScenarios() {
+  const select = document.getElementById('demo-scenario-select');
+  try {
+    const resp = await fetch('/api/v1/testing/demo-scenarios');
+    if (!resp.ok) {
+      const err = await resp.json().catch(function () { return {}; });
+      select.innerHTML = '<option>Failed to load: ' + esc(err.detail || resp.statusText) + '</option>';
+      return;
+    }
+    const scenarios = await resp.json();
+    select.innerHTML = scenarios.map(function (s) {
+      return '<option value="' + esc(s.name) + '">' + esc(s.description) + '</option>';
+    }).join('');
+  } catch (e) {
+    select.innerHTML = '<option>Failed to load: ' + esc(e.message) + '</option>';
+  }
+}
+
+document.getElementById('demo-scenario-form').addEventListener('submit', async function (ev) {
+  ev.preventDefault();
+  const scenario = document.getElementById('demo-scenario-select').value;
+  const resultEl = document.getElementById('demo-scenario-result');
+  const btn = ev.target.querySelector('button');
+  btn.disabled = true;
+  resultEl.innerHTML = '<div class="rationale-text">Running \u2014 this hits real APIs if you have real credentials configured (Groq, Shippo, Qdrant Cloud), so it can genuinely take up to a couple of minutes, not just a few seconds...</div>';
+  try {
+    const resp = await fetch('/api/v1/testing/demo-scenarios/run', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({scenario: scenario}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      resultEl.innerHTML = '<div class="empty-state">Failed: ' + esc(data.detail || resp.statusText) + '</div>';
+      return;
+    }
+    let html = '';
+    if (data.case_id) {
+      html += '<p>' + (data.success ? '\u2705' : '\u26a0\ufe0f') + ' <a href="/cases/' + esc(data.case_id) + '">View case ' + esc(data.case_id) + '</a></p>';
+    } else {
+      html += '<p>' + (data.success ? '\u2705 Ran successfully' : '\u274c Failed') + ' — no case_id found in output.</p>';
+    }
+    html += '<details><summary style="cursor:pointer;">Script output</summary><pre style="white-space:pre-wrap; font-size:12px;">' + esc(data.output) + '</pre></details>';
+    resultEl.innerHTML = html;
+  } catch (e) {
+    resultEl.innerHTML = '<div class="empty-state">Failed: ' + esc(e.message) + '</div>';
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+loadDemoScenarios();
 loadScenarioCheckboxes();
 loadRunHistory();
 

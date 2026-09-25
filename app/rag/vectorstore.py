@@ -98,39 +98,83 @@ def ensure_collection(client: QdrantClient, collection: str, dim: int) -> None:
         ("doc_type", PayloadSchemaType.KEYWORD),
         ("channel", PayloadSchemaType.KEYWORD),
         ("product_category", PayloadSchemaType.KEYWORD),
+        # Added to fix a real, confirmed production bug: delete_nodes_by_doc_id
+        # (and the count-before-delete check in app/api/v1/policies.py's
+        # delete_policy) both filter on this field, and Qdrant's SERVER/
+        # CLOUD mode requires an explicit index to filter on any field at
+        # all - it returned a real, clear 400 ("Index required but not
+        # found for 'doc_id'") the moment a real user tried it against
+        # real Qdrant Cloud. The LOCAL embedded mode this project's own
+        # test suite runs against does NOT enforce this requirement at
+        # all, which is exactly why every test passed while this was
+        # completely broken against real cloud infrastructure - a real,
+        # confirmed gap in test coverage, not a flaw in the delete logic
+        # itself. create_payload_index is idempotent and this function
+        # already runs unconditionally on every call (see this
+        # function's own docstring above), so this retroactively fixes
+        # any EXISTING cloud collection the next time ensure_collection
+        # runs (app startup, or the next ingestion call) - no manual
+        # migration step needed.
+        ("doc_id", PayloadSchemaType.KEYWORD),
     ]:
         client.create_payload_index(
             collection_name=collection, field_name=field_name, field_schema=schema_type,
         )
 
 
-def refresh_node_metadata(client: QdrantClient, collection: str, node_ids: list[str], metadata: dict) -> None:
-    """Updates ONLY the document-level metadata fields on already-embedded
-    points, without touching their vectors or re-computing embeddings —
-    Qdrant's set_payload is a cheap, vector-untouched operation, exactly
-    the right tool for this.
+def refresh_stale_metadata(client: QdrantClient, collection: str, node_id_to_expected_payload: dict[str, dict]) -> dict[str, list[str]]:
+    """Generalizes refresh_node_metadata and refresh_stale_page_numbers
+    (both retired in favor of this) into one mechanism that catches ANY
+    metadata field drifting on a chunk whose TEXT is unchanged - not
+    just document-level fields, not just page. Detects the need to
+    update WITHOUT knowing in advance which field changed: for each
+    node, it's handed the full payload that a fresh embed would write
+    right now (computed the same way upsert_nodes computes it, just
+    without needing a new vector for text that hasn't changed), reads
+    what's ACTUALLY stored, and does a genuine field-by-field diff.
+    Whatever differs gets patched via set_payload; whatever already
+    matches is left alone, so this never writes more than the real
+    drift requires.
 
-    Fixes a real, previously-undiscovered bug found from an actual
-    production run: incremental reindexing's skip logic operates at the
-    per-CHUNK text-hash level (skip re-embedding if this specific
-    chunk's text hasn't changed) — but document-level metadata (like
-    return_window_days_by_category, added after the original ingestion)
-    is the SAME for every chunk of a document, and can change
-    independent of any individual chunk's text. A chunk whose text
-    genuinely never changed was never re-upserted at all under the old
-    logic, so it silently kept whatever metadata existed at the moment
-    it was FIRST embedded — forever, even after a real metadata schema
-    change and a full re-ingestion run. A live deployment ingested an
-    updated return-policy PDF specifically to pick up a new field, and
-    the majority of its chunks (unchanged text) kept the stale metadata
-    indefinitely, causing a real resolution decision to route to
-    low-confidence denial for lack of data that had, in fact, already
-    been re-ingested — just not applied to the specific chunk retrieval
-    happened to return.
+    Args:
+        node_id_to_expected_payload: {old_node_id: {field: value, ...}}
+            — the full, freshly-computed metadata each old (still-valid,
+            unchanged-text) point SHOULD currently have. Multiple old
+            node_ids commonly share an identical expected dict (sibling
+            chunks from the same page share both page and document-
+            level metadata) — that's fine; each is still compared and
+            patched independently, since what's ACTUALLY stored for
+            each specific point could differ even when what SHOULD be
+            stored doesn't (e.g. a prior partial write only reached
+            some of them).
+
+    Returns:
+        {node_id: [field_names_that_were_actually_corrected]} — only
+        for nodes where at least one field genuinely differed. A node
+        with no drift at all is simply absent from this dict, not
+        present with an empty list — the cheapest possible signal for
+        "nothing needed doing here."
     """
+    corrected: dict[str, list[str]] = {}
+    node_ids = list(node_id_to_expected_payload.keys())
     if not node_ids:
-        return
-    client.set_payload(collection_name=collection, payload=metadata, points=node_ids)
+        return corrected
+    try:
+        stored_points = client.retrieve(collection_name=collection, ids=node_ids, with_payload=True)
+    except Exception:
+        # Nothing stored yet to compare against (e.g. first-time path) -
+        # nothing to correct.
+        return corrected
+    stored_by_id = {p.id: (p.payload or {}) for p in stored_points}
+    for node_id, expected in node_id_to_expected_payload.items():
+        stored = stored_by_id.get(node_id)
+        if stored is None:
+            continue
+        diff = {field: value for field, value in expected.items() if stored.get(field) != value}
+        if diff:
+            client.set_payload(collection_name=collection, payload=diff, points=[node_id])
+            corrected[node_id] = list(diff.keys())
+    return corrected
 
 
 def upsert_nodes(client: QdrantClient, collection: str, nodes: list[RagNode], vectors: np.ndarray) -> None:
@@ -160,6 +204,59 @@ def upsert_nodes(client: QdrantClient, collection: str, nodes: list[RagNode], ve
         points.append(PointStruct(id=node.node_id, vector=vec.tolist(), payload=payload))
     if points:
         client.upsert(collection_name=collection, points=points)
+
+
+def delete_points_by_ids(client: QdrantClient, collection: str, point_ids: list[str]) -> int:
+    """Deletes specific points by their exact IDs - the counterpart to
+    delete_nodes_by_doc_id above, needed for STALE-CHUNK cleanup on
+    re-ingestion: when content is genuinely removed from a document
+    (a sentence deleted, or - per a real user scenario - one filename
+    superseding another under the same doc_id with different content),
+    the OLD chunks that no longer correspond to anything in the
+    current document must be individually removed, not the whole
+    doc_id's worth of points at once (which would also wipe out chunks
+    that are still correct and unchanged).
+
+    Returns the actual number of points that existed and were removed
+    (Qdrant's own delete() call doesn't report a count), via the same
+    count-then-delete pattern as delete_nodes_by_doc_id."""
+    if not point_ids:
+        return 0
+    try:
+        existing = client.retrieve(collection_name=collection, ids=point_ids, with_payload=False)
+    except Exception:
+        return 0
+    if not existing:
+        return 0
+    client.delete(collection_name=collection, points_selector=[p.id for p in existing])
+    return len(existing)
+
+
+def delete_nodes_by_doc_id(client: QdrantClient, collection: str, doc_id: str) -> int:
+    """Deletes every chunk/embedding belonging to one policy document,
+    identified by its doc_id payload field - the counterpart to
+    upsert_nodes above, needed for real per-document deletion (as
+    opposed to delete_collection, which wipes every document at once).
+
+    Returns the count of points that existed before deletion (Qdrant's
+    own delete() call doesn't report how many it removed, so this does
+    a count-then-delete rather than trusting an assumed return value)."""
+    try:
+        existing = client.count(
+            collection_name=collection,
+            count_filter=Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]),
+        ).count
+    except Exception:
+        # Collection may not exist yet if nothing has ever been ingested -
+        # nothing to delete either way.
+        return 0
+    if existing == 0:
+        return 0
+    client.delete(
+        collection_name=collection,
+        points_selector=Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]),
+    )
+    return existing
 
 
 def build_temporal_filter(as_of_date: str, channel: str | None = None,

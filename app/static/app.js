@@ -77,7 +77,7 @@ function initApiKeyWidget() {
 document.addEventListener('DOMContentLoaded', initApiKeyWidget);
 
 async function apiGet(path) {
-  const res = await fetch(path);
+  const res = await fetch(path, { cache: 'no-store' });
   if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
   return res.json();
 }
@@ -177,6 +177,9 @@ async function initCaseDetail() {
     html += '<div class="field-row"><div class="field-label">Exception type</div><div class="field-value">' + esc(c.exception_type) + '</div></div>';
     html += '<div class="field-row"><div class="field-label">State</div><div class="field-value">' + badge(c.state, c.state) + '</div></div>';
     html += '<div class="field-row"><div class="field-label">Fraud risk score</div><div class="field-value">' + (c.fraud_risk_score !== null && c.fraud_risk_score !== undefined ? c.fraud_risk_score : '\u2014') + (c.fraud_flag ? ' ' + badge('flagged', 'flagged') : '') + '</div></div>';
+    if (c.fraud_reasons && c.fraud_reasons.length) {
+      html += '<div class="field-row"><div class="field-label">Fraud reasons</div><div class="field-value">' + c.fraud_reasons.map(esc).join('<br>') + '</div></div>';
+    }
     html += '<div class="field-row"><div class="field-label">Created</div><div class="field-value">' + fmtDate(c.created_at) + '</div></div>';
     html += '<div class="field-row"><div class="field-label">Trace</div><div class="field-value"><a href="/traces/' + esc(c.id) + '">View full trace \u2192</a></div></div>';
     html += '</div>';
@@ -196,6 +199,25 @@ async function initCaseDetail() {
       html += '<div class="field-row"><div class="field-label">Reasoning</div><div class="field-value">' + esc(c.resolution_decision.reasoning) + '</div></div>';
       if (c.resolution_decision.cited_policy) {
         html += '<div class="field-row"><div class="field-label">Cited policy</div><div class="field-value id">' + esc(c.resolution_decision.cited_policy.doc_id) + ' v' + esc(c.resolution_decision.cited_policy.version) + '</div></div>';
+      }
+      if (c.resolution_decision.similar_past_cases && c.resolution_decision.similar_past_cases.length) {
+        html += '<div class="field-row"><div class="field-label">Similar past cases</div><div class="field-value">' +
+          c.resolution_decision.similar_past_cases.map(function(s) {
+            return esc(s.case_id) + ' (similarity ' + esc(s.similarity != null ? s.similarity.toFixed(2) : s.similarity) + ') \u2192 ' +
+              esc(s.human_final_resolution ? JSON.stringify(s.human_final_resolution) : '\u2014');
+          }).join('<br>') + '</div></div>';
+      }
+      html += '</div>';
+    }
+
+    if (c.working_memory_summary && c.working_memory_summary.running_summary) {
+      html += '<div class="panel"><h2>Case Summary (working memory)</h2>';
+      html += '<div class="field-row"><div class="field-label">Running summary</div><div class="field-value">' + esc(c.working_memory_summary.running_summary) + '</div></div>';
+      if (c.working_memory_summary.recent_items && c.working_memory_summary.recent_items.length) {
+        html += '<div class="field-row"><div class="field-label">Recent steps</div><div class="field-value">' +
+          c.working_memory_summary.recent_items.map(function(item) {
+            return esc('[' + item.agent + '] ' + item.summary);
+          }).join('<br>') + '</div></div>';
       }
       html += '</div>';
     }
@@ -269,16 +291,31 @@ async function initPolicies() {
       return;
     }
     let rows = data.files_on_disk.map(function (f) {
-      const stem = f.replace(/\.pdf$/i, '');
-      const indexed = data.indexed_doc_ids.indexOf(stem) !== -1;
       const info = (data.file_status || {})[f] || {};
+      // Uses the backend's own file_status directly, not a
+      // recomputed guess - found and fixed a real, confirmed bug
+      // directly from a user report: this used to independently
+      // derive "indexed" from `f.replace('.pdf','')` being present in
+      // indexed_doc_ids - the exact same "filename stem equals doc_id"
+      // assumption that was already found wrong and fixed on the
+      // BACKEND (app/api/v1/policies.py's list_policies, which
+      // resolves the real doc_id via source_filename tracking, not a
+      // filename guess) - but the fix was never carried over to this
+      // file. The backend was correctly reporting "indexed" the whole
+      // time; this line was silently throwing that correct answer away
+      // and computing its own, stale, wrong one instead. Confirmed
+      // directly: a raw API response showed file_status correctly
+      // saying "indexed" while this exact line still rendered "not
+      // indexed" from the same data.
+      const indexed = info.status === "indexed";
       const statusCell = indexed
         ? badge('indexed', 'resolved')
         : badge('not indexed', 'blocked') + '<div class="rationale-text">' + esc(info.detail || '') + '</div>' +
           '<button style="margin-top:4px;" onclick="retryIngestion(\'' + esc(f) + '\')">Retry ingestion</button>';
-      return '<tr><td class="id">' + esc(f) + '</td><td>' + statusCell + '</td></tr>';
+      return '<tr><td class="id">' + esc(f) + '</td><td>' + statusCell + '</td>' +
+             '<td><button class="danger" onclick="deletePolicyDocument(\'' + esc(f) + '\')">Delete</button></td></tr>';
     }).join('');
-    root.innerHTML = '<table><thead><tr><th>File</th><th>Indexed</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    root.innerHTML = '<table><thead><tr><th>File</th><th>Indexed</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>';
   }
   await render();
   window._reloadPolicies = render;
@@ -293,7 +330,11 @@ async function initPolicies() {
       const res = await fetch('/api/v1/policies/upload', { method: 'POST', body: formData });
       const body = await res.json();
       if (!res.ok) throw new Error(body.detail || 'Upload failed');
-      toast('Indexed: ' + body.filename + ' (' + (body.summary && body.summary.doc_id ? body.summary.doc_id : 'ready') + ')');
+      const s = body.summary || {};
+      const chunkInfo = (s.total_nodes !== undefined)
+        ? ` \u2014 ${s.embedded_this_run}/${s.total_nodes} chunks embedded` + (s.skipped_unchanged ? `, ${s.skipped_unchanged} unchanged (skipped)` : '')
+        : '';
+      toast('Indexed: ' + body.filename + chunkInfo);
       fileInput.value = '';
       await render();
     } catch (e) {
@@ -302,12 +343,29 @@ async function initPolicies() {
   });
 }
 
+async function deletePolicyDocument(filename) {
+  if (!confirm('Delete ' + filename + '? This removes it from active retrieval, its indexed chunks, and its file on disk. Past decisions that cited it are never affected or removed.')) return;
+  try {
+    const resp = await fetch('/api/v1/policies/' + encodeURIComponent(filename) + '?confirm=true', { method: 'DELETE' });
+    const body = await resp.json();
+    if (!resp.ok) throw new Error(body.detail || 'Delete failed');
+    toast('Deleted ' + filename + (body.cited_in_case_count ? ' \u2014 cited in ' + body.cited_in_case_count + ' past case(s), which remain untouched' : ''));
+    if (window._reloadPolicies) window._reloadPolicies();
+  } catch (e) {
+    toast('Error: ' + e.message, true);
+  }
+}
+
 async function retryIngestion(filename) {
   try {
     const resp = await fetch('/api/v1/policies/' + encodeURIComponent(filename) + '/reingest', { method: 'POST' });
     const body = await resp.json();
     if (!resp.ok) throw new Error(body.detail || 'Retry failed');
-    toast('Indexed: ' + body.filename);
+    const s = body.summary || {};
+    const chunkInfo = (s.total_nodes !== undefined)
+      ? ` \u2014 ${s.embedded_this_run}/${s.total_nodes} chunks embedded` + (s.skipped_unchanged ? `, ${s.skipped_unchanged} unchanged (skipped)` : '')
+      : '';
+    toast('Indexed: ' + body.filename + chunkInfo);
     if (window._reloadPolicies) await window._reloadPolicies();
   } catch (e) {
     toast('Error: ' + e.message, true);

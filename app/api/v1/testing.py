@@ -15,6 +15,7 @@ corrupted this live application's own database connection for the rest
 of the process's lifetime the moment this endpoint was first hit.
 """
 import json
+import re
 import subprocess
 import sys
 import uuid
@@ -328,3 +329,119 @@ def get_rag_eval_history(limit: int = 50, db: Session = Depends(get_db), _auth=D
         }
         for r in runs
     ]
+
+
+# ── Demo scenarios: one-click, realistic end-to-end cases via the UI ───────
+# Each entry below maps to a real script under scripts/ that already
+# seeds realistic underlying data (order, stock, payment status,
+# customer history) and runs the actual pipeline - these are the exact
+# same scripts documented for CLI use, exposed here so a person can
+# trigger one from a browser instead of a terminal and land straight on
+# the resulting case. Unlike the golden-set runner above, these
+# deliberately do NOT strip real credentials from the subprocess
+# environment - the whole point of a demo is to show the real pipeline
+# against whatever real Stripe/Groq/Qdrant/etc is actually configured,
+# same as running the script by hand would.
+DEMO_SCENARIOS = {
+    "full_pipeline_demo": "Payment declined, end-to-end (webhook -> diagnosis -> resolution, one call)",
+    "return_pipeline_demo": "Ordinary return request within policy - nothing broken, just a decision to make",
+    "delivery_pipeline_demo": "Carrier tracking shows the package lost/stuck in transit",
+    "fraud_pipeline_demo": "Prior fraud flag + same-day address change - crosses the real fraud threshold",
+    "inventory_pipeline_demo": "Requested quantity exceeds sellable stock (not just on-hand)",
+    "refund_demo": "Direct refund tool call against the real/fake payment gateway",
+    "reship_demo": "Direct reship + return-label tool call against the real/fake carrier gateway",
+}
+
+_CASE_ID_PATTERN = re.compile(r"/cases/([A-Za-z0-9_-]+)")
+
+
+@router.get("/demo-scenarios")
+def list_demo_scenarios(_auth=Depends(require_admin)):
+    """Every demo scenario available to trigger, with a short
+    description - lets the UI render a picker instead of hardcoding the
+    list client-side, so adding a new scenario here is the only place
+    that needs to change."""
+    return [{"name": name, "description": desc} for name, desc in DEMO_SCENARIOS.items()]
+
+
+class RunDemoScenarioRequest(BaseModel):
+    scenario: str
+
+
+@router.post("/demo-scenarios/run")
+def run_demo_scenario(payload: RunDemoScenarioRequest, _auth=Depends(require_admin)):
+    """Runs the selected demo script in a SEPARATE PROCESS - same
+    reasoning as the golden-set runner above (these scripts freely
+    create/reuse their own DB sessions and, in full_pipeline_demo's
+    case, construct their own in-process TestClient(app); running that
+    inside this already-running app's own request-handling process
+    risks exactly the same kind of interference). Deliberately inherits
+    the real environment (not stripped) - a demo's whole purpose is to
+    show the real pipeline against whatever's actually configured.
+    Extracts the resulting case_id by scanning stdout for a
+    "/cases/<id>" reference, since that's what every script already
+    prints as its own "here's where to look" pointer - no per-script
+    special-casing needed here as new scenarios are added, as long as
+    each new script keeps printing that same kind of pointer."""
+    if payload.scenario not in DEMO_SCENARIOS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown scenario '{payload.scenario}'. Available: {list(DEMO_SCENARIOS.keys())}",
+        )
+
+    # Checked directly, not assumed: these demo scripts were built for
+    # standalone CLI use and use whatever local Qdrant path
+    # get_qdrant_client() defaults to - the SAME path this already-
+    # running app's own process is holding open (Qdrant's embedded local
+    # mode is single-process only; it raises rather than corrupting
+    # data). This is fine when a real, concurrent-safe Qdrant Cloud
+    # instance is configured (QDRANT_URL) - both processes talk to the
+    # same remote collection with no lock conflict. When only the local
+    # embedded fallback is available, this endpoint would otherwise fail
+    # with a confusing "Storage folder already accessed" stack trace -
+    # this check turns that into an actionable message instead.
+    from app.core.config import get_settings
+    if not get_settings().qdrant_url:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This demo needs to open its own Qdrant connection, and no QDRANT_URL (Qdrant Cloud) "
+                "is configured - only the local, single-process embedded Qdrant, which this already-"
+                "running server is currently holding open. Either configure QDRANT_URL for a real "
+                "concurrent-safe instance, or stop this server and run the script directly: "
+                f"python scripts/{payload.scenario}.py"
+            ),
+        )
+
+    cmd = [sys.executable, f"scripts/{payload.scenario}.py"]
+    try:
+        # 240s, not 60s - found necessary directly from a real user
+        # timeout. Unlike the golden-set runner above, this endpoint
+        # deliberately does NOT strip real credentials, since a demo's
+        # whole point is to exercise the real pipeline - which means a
+        # real, possibly multi-step Groq diagnosis loop, real Qdrant
+        # Cloud retrieval, and potentially a real Shippo call, each a
+        # genuine network round-trip rather than an in-memory fake. 60s
+        # was tuned by copying the golden-set runner's number without
+        # accounting for this difference; a real LLM-driven diagnosis
+        # legitimately needs more room than a fully-mocked regression
+        # check does.
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Demo scenario '{payload.scenario}' exceeded 240s - check the server's own "
+                    f"terminal output for what it was doing when it stalled.",
+        )
+
+    output = result.stdout + result.stderr
+    match = _CASE_ID_PATTERN.search(output)
+    case_id = match.group(1) if match else None
+
+    return {
+        "scenario": payload.scenario,
+        "success": result.returncode == 0,
+        "case_id": case_id,
+        "output": output[-4000:],  # tail only - some of these print a lot
+    }
+

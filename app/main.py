@@ -22,6 +22,8 @@ def _register_job_handlers() -> None:
     q.register_handler("process_inventory_webhook", handlers.handle_inventory_webhook)
     q.register_handler("process_carrier_webhook", handlers.handle_carrier_webhook)
     q.register_handler("tier3_judge_sample", handlers.handle_tier3_judge_sample)
+    q.register_handler("log_episode", handlers.handle_log_episode)
+    q.register_handler("log_cross_customer_signal", handlers.handle_log_cross_customer_signal)
 
 
 @asynccontextmanager

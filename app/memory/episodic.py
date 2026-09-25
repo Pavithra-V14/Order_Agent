@@ -56,6 +56,58 @@ def log_episode(db: Session, customer_id: str, episode_type: str, content: dict,
     }
 
 
+def log_episode_async(customer_id: str, episode_type: str, content: dict,
+                       occurred_at: datetime, case_id: str | None = None) -> str:
+    """Memory-upgrade follow-up: enqueues the SAME write log_episode()
+    does, but off the calling request's hot path - see
+    app/workers/handlers.py's handle_log_episode() for the full
+    reasoning (the real, named latency cost this addresses: when
+    Graphiti/Neo4j is active, one log_episode() call is 3 real network
+    round-trips, worst-case bounded by GRAPHITI_CALL_TIMEOUT_SECONDS).
+
+    Returns a job_id immediately (ack-fast, same contract as every
+    webhook handler in this project) - the actual write happens on the
+    job queue's worker thread/process. Callers that need to confirm the
+    write actually landed (mainly tests) poll
+    get_job_queue().get_job(job_id), same pattern as
+    tests/test_phase12_api.py's webhook tests.
+
+    Deliberately does NOT take a db session - the handler opens its own
+    (app/workers/handlers.py's _get_session()), since this call may run
+    on a different thread, or in a genuinely separate process entirely
+    (RQJobQueue via scripts/run_rq_worker.py), where the caller's
+    session would not be valid.
+
+    HONEST TRADEOFF: this makes the write EVENTUALLY consistent, not
+    immediate - see handle_log_episode()'s docstring for exactly which
+    reads this can and can't affect. Not used for reads
+    (get_customer_history) - those still block, since the agent calling
+    them genuinely needs the data now to score risk.
+    """
+    from app.workers.job_queue import get_job_queue
+    from app.workers.handlers import handle_log_episode
+    q = get_job_queue()
+    # Idempotent, defensive registration - see start_worker() comment
+    # below for why this can't rely solely on app.main's startup hook
+    # having run. register_handler() is a plain dict assignment
+    # (job_queue.py), so calling it repeatedly with the same function
+    # is harmless.
+    q.register_handler("log_episode", handle_log_episode)
+    # Defensive, idempotent: InProcessJobQueue.start_worker() no-ops if
+    # already running; RQJobQueue.start_worker() is unconditionally a
+    # no-op (see its own docstring). Needed because this function is
+    # called from plain Python code (resolution_completion.py,
+    # orchestrator.py), not only from FastAPI request handlers where
+    # app.main's lifespan hook already started the worker - a direct
+    # function call (including most of this project's own tests) would
+    # otherwise enqueue into a queue nothing is ever draining.
+    q.start_worker()
+    return q.enqueue("log_episode", {
+        "customer_id": customer_id, "episode_type": episode_type, "content": content,
+        "occurred_at_iso": occurred_at.isoformat(), "case_id": case_id,
+    })
+
+
 def get_customer_history(db: Session, customer_id: str, episode_type: str | None = None,
                           limit: int = 20) -> list[dict]:
     """Time-ordered (most recent first) episode history for a customer —

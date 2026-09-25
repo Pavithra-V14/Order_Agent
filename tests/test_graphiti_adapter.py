@@ -543,3 +543,437 @@ def test_kuzu_driver_construction_is_thread_safe_under_real_concurrency():
         os.environ.pop("KUZU_LOCAL_PATH", None)
         ga.reset_graphiti_client()
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# --- Stage 1 memory upgrade: find_related_fraud_signals --------------------
+#
+# Cross-customer fraud query tests. Scope, stated honestly (same
+# discipline as this file's own module docstring): what's verified here
+# is (1) every "signal genuinely unavailable" path returns [] rather
+# than raising, and (2) the Cypher/params sent to a MOCKED Neo4j driver
+# are exactly what find_related_fraud_signals claims to send, and its
+# result-parsing correctly reconstructs the expected dicts from a
+# realistic mocked EagerResult shape. A real query against a live Neo4j
+# Aura instance, containing real Graphiti-written Episodic nodes, is NOT
+# run here — that requires a real Aura instance this sandbox cannot
+# reach (see scripts/test_neo4j_connection.py for that verification,
+# meant to be run against a real instance).
+
+def test_find_related_fraud_signals_returns_empty_with_no_fingerprint():
+    from app.memory.graphiti_adapter import find_related_fraud_signals
+    assert find_related_fraud_signals(None, exclude_customer_id="CUST-1") == []
+    assert find_related_fraud_signals("", exclude_customer_id="CUST-1") == []
+
+
+def test_find_related_fraud_signals_returns_empty_without_groq_key():
+    os.environ.pop("GROQ_API_KEY", None)
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    from app.memory.graphiti_adapter import find_related_fraud_signals
+    assert find_related_fraud_signals("fp_abc123", exclude_customer_id="CUST-1") == []
+
+
+def test_find_related_fraud_signals_returns_empty_on_kuzu_backend(caplog):
+    """Groq key present (Graphiti active) but NEO4J_URI unset -> Kuzu is
+    the active backend. This query is Neo4j-only by design (see the
+    function's own docstring on why Kuzu's dialect isn't wired here) -
+    must return [] with a clear log message, not silently do nothing
+    and not attempt a Kuzu query with Neo4j Cypher syntax."""
+    os.environ["GROQ_API_KEY"] = "gsk_fake_test_key"
+    os.environ.pop("NEO4J_URI", None)
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    from app.memory.graphiti_adapter import find_related_fraud_signals
+    import logging
+    with caplog.at_level(logging.INFO, logger="graphiti_adapter"):
+        result = find_related_fraud_signals("fp_abc123", exclude_customer_id="CUST-1")
+    assert result == []
+    assert any("Neo4j Aura not configured" in r.message for r in caplog.records)
+
+
+def test_find_related_fraud_signals_queries_neo4j_with_correct_params(monkeypatch):
+    """The core mechanism test: with Neo4j configured, verifies (1) the
+    exact Cypher query text and parameter dict sent to the driver match
+    what the function's own docstring claims — group_id exclusion, the
+    JSON substring markers for payment_fingerprint and
+    episode_type=fraud_flag_raised — and (2) a realistic mocked
+    EagerResult (list of dict-like records) is correctly turned into the
+    expected [{"customer_id", "fraud_episode_id", "flagged_at"}, ...]
+    shape."""
+    os.environ["GROQ_API_KEY"] = "gsk_fake_test_key"
+    os.environ["NEO4J_URI"] = "neo4j+s://fake-instance.databases.neo4j.io"
+    os.environ["NEO4J_PASSWORD"] = "fake_password"
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    captured = {}
+
+    class FakeRecord(dict):
+        def __getitem__(self, key):
+            return dict.__getitem__(self, key)
+
+    class FakeEagerResult:
+        def __init__(self, records):
+            self.records = records
+
+    class FakeNeo4jDriverForQuery:
+        def __init__(self, uri, user, password, database):
+            captured["construct_args"] = {"uri": uri, "user": user, "password": password, "database": database}
+
+        async def execute_query(self, cypher_query_, params=None):
+            captured["cypher"] = cypher_query_
+            captured["params"] = params
+            return FakeEagerResult([
+                FakeRecord(other_customer_id="CUST-OTHER-1", fraud_episode_uuid="ep-uuid-1", flagged_at="2025-06-01T00:00:00Z"),
+            ])
+
+        async def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr("graphiti_core.driver.neo4j_driver.Neo4jDriver", FakeNeo4jDriverForQuery)
+
+    from app.memory.graphiti_adapter import find_related_fraud_signals
+    result = find_related_fraud_signals("fp_shared_card_123", exclude_customer_id="CUST-UNDER-REVIEW")
+
+    assert result == [
+        {"customer_id": "CUST-OTHER-1", "fraud_episode_id": "ep-uuid-1", "flagged_at": "2025-06-01T00:00:00Z"},
+    ]
+    assert captured["closed"] is True
+    assert captured["params"]["exclude_customer_id"] == "CUST-UNDER-REVIEW"
+    assert captured["params"]["fingerprint_marker"] == '"payment_fingerprint": "fp_shared_card_123"'
+    assert captured["params"]["fraud_marker"] == '"episode_type": "fraud_flag_raised"'
+    # The query must exclude the reviewed customer's own group_id and
+    # join through group_id, not through episode identity - a customer
+    # can be flagged in a DIFFERENT case than the one carrying the
+    # matching fingerprint.
+    assert "matching_episode.group_id <> $exclude_customer_id" in captured["cypher"]
+    assert "fraud_episode:Episodic {group_id: other_customer_id}" in captured["cypher"]
+
+
+def test_find_related_fraud_signals_returns_empty_when_no_match(monkeypatch):
+    os.environ["GROQ_API_KEY"] = "gsk_fake_test_key"
+    os.environ["NEO4J_URI"] = "neo4j+s://fake-instance.databases.neo4j.io"
+    os.environ["NEO4J_PASSWORD"] = "fake_password"
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    class FakeEagerResultEmpty:
+        records = []
+
+    class FakeNeo4jDriverNoMatch:
+        def __init__(self, uri, user, password, database):
+            pass
+
+        async def execute_query(self, cypher_query_, params=None):
+            return FakeEagerResultEmpty()
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("graphiti_core.driver.neo4j_driver.Neo4jDriver", FakeNeo4jDriverNoMatch)
+
+    from app.memory.graphiti_adapter import find_related_fraud_signals
+    assert find_related_fraud_signals("fp_unique_no_matches", exclude_customer_id="CUST-1") == []
+
+
+def test_find_related_fraud_signals_swallows_a_real_query_error(monkeypatch, caplog):
+    """A genuinely down/misconfigured Neo4j instance must degrade to 'no
+    signal available', not propagate and break fraud scoring - same
+    non-fatal discipline as every other memory-write path in this
+    project (resolution_completion.py, orchestrator.py's
+    fraud_flag_raised logging)."""
+    os.environ["GROQ_API_KEY"] = "gsk_fake_test_key"
+    os.environ["NEO4J_URI"] = "neo4j+s://fake-instance.databases.neo4j.io"
+    os.environ["NEO4J_PASSWORD"] = "fake_password"
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    class FakeNeo4jDriverBroken:
+        def __init__(self, uri, user, password, database):
+            pass
+
+        async def execute_query(self, cypher_query_, params=None):
+            raise RuntimeError("Unable to retrieve routing information")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("graphiti_core.driver.neo4j_driver.Neo4jDriver", FakeNeo4jDriverBroken)
+
+    import logging
+    from app.memory.graphiti_adapter import find_related_fraud_signals
+    with caplog.at_level(logging.WARNING, logger="graphiti_adapter"):
+        result = find_related_fraud_signals("fp_abc123", exclude_customer_id="CUST-1")
+    assert result == []
+    assert any("failed (non-fatal" in r.message for r in caplog.records)
+
+
+# --- Genuine Graphiti-native cross-customer relations -----------------
+#
+# Answers the actual question this was built for: "does Graphiti's own
+# extraction pipeline have relations across customers now?" - via a
+# SEPARATE, opt-in shared group_id, not by changing per-customer
+# episode isolation (unchanged, and confirmed unchanged by these tests).
+
+def test_add_episode_default_group_id_is_still_customer_id(monkeypatch):
+    """Regression guard: the group_id_override parameter must be
+    opt-in only - every existing caller (log_episode_graphiti) that
+    doesn't pass it must see IDENTICAL group_id behavior to before this
+    change (per-customer isolation, unchanged)."""
+    os.environ["GROQ_API_KEY"] = "gsk_fake_test_key"
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    captured = {}
+
+    class FakeGraphitiCapturesGroupId:
+        def __init__(self, llm_client, embedder, graph_driver, cross_encoder=None):
+            pass
+
+        async def build_indices_and_constraints(self):
+            pass
+
+        async def add_episode(self, **kwargs):
+            captured["group_id"] = kwargs["group_id"]
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("graphiti_core.Graphiti", FakeGraphitiCapturesGroupId)
+
+    import app.memory.graphiti_adapter as ga
+    from datetime import datetime, timezone
+    ga.log_episode_graphiti("CUST-DEFAULT-GROUP", "case_resolved", {"n": 1},
+                             occurred_at=datetime(2025, 6, 1, tzinfo=timezone.utc))
+
+    assert captured["group_id"] == "CUST-DEFAULT-GROUP"
+
+
+def test_log_cross_customer_signal_uses_the_shared_group_id_not_customer_id(monkeypatch):
+    """THE mechanism test: unlike every other episode this project
+    writes, this one must land in the SHARED group_id - this is
+    specifically what gives Graphiti's own dedup a chance to relate two
+    DIFFERENT customers' mentions of the same signal, per
+    log_cross_customer_signal's own docstring."""
+    os.environ["GROQ_API_KEY"] = "gsk_fake_test_key"
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    captured = {}
+
+    class FakeGraphitiCapturesGroupId:
+        def __init__(self, llm_client, embedder, graph_driver, cross_encoder=None):
+            pass
+
+        async def build_indices_and_constraints(self):
+            pass
+
+        async def add_episode(self, **kwargs):
+            captured["group_id"] = kwargs["group_id"]
+            captured["episode_body"] = kwargs["episode_body"]
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("graphiti_core.Graphiti", FakeGraphitiCapturesGroupId)
+
+    from app.memory.graphiti_adapter import log_cross_customer_signal, _CROSS_CUSTOMER_SIGNALS_GROUP_ID
+    result = log_cross_customer_signal(
+        customer_id="CUST-A", signal_type="payment_fingerprint", signal_value="fp_shared_123",
+        case_id="case-1",
+    )
+
+    assert captured["group_id"] == _CROSS_CUSTOMER_SIGNALS_GROUP_ID
+    assert captured["group_id"] != "CUST-A"
+    assert "fp_shared_123" in captured["episode_body"]
+    assert "CUST-A" in captured["episode_body"]
+    assert result == {"customer_id": "CUST-A", "signal_type": "payment_fingerprint", "signal_value": "fp_shared_123"}
+
+
+def test_log_cross_customer_signal_returns_empty_dict_without_groq_key():
+    os.environ.pop("GROQ_API_KEY", None)
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    from app.memory.graphiti_adapter import log_cross_customer_signal
+    assert log_cross_customer_signal("CUST-A", "payment_fingerprint", "fp_1") == {}
+
+
+def test_search_cross_customer_relations_queries_the_shared_group_id(monkeypatch):
+    os.environ["GROQ_API_KEY"] = "gsk_fake_test_key"
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    captured = {}
+
+    class FakeEdge:
+        def __init__(self, fact, name, uuid):
+            self.fact, self.name, self.uuid = fact, name, uuid
+
+    class FakeGraphitiSearch:
+        def __init__(self, llm_client, embedder, graph_driver, cross_encoder=None):
+            pass
+
+        async def build_indices_and_constraints(self):
+            pass
+
+        async def search(self, query, group_ids=None, num_results=10):
+            captured["query"] = query
+            captured["group_ids"] = group_ids
+            captured["num_results"] = num_results
+            return [FakeEdge("Customer CUST-A shares a payment method with CUST-B", "RELATES_TO", "edge-uuid-1")]
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("graphiti_core.Graphiti", FakeGraphitiSearch)
+
+    from app.memory.graphiti_adapter import search_cross_customer_relations, _CROSS_CUSTOMER_SIGNALS_GROUP_ID
+    results = search_cross_customer_relations("fp_shared_123", num_results=5)
+
+    assert captured["group_ids"] == [_CROSS_CUSTOMER_SIGNALS_GROUP_ID]
+    assert captured["num_results"] == 5
+    assert results == [{"fact": "Customer CUST-A shares a payment method with CUST-B",
+                         "name": "RELATES_TO", "uuid": "edge-uuid-1"}]
+
+
+def test_search_cross_customer_relations_returns_empty_on_search_error(monkeypatch):
+    os.environ["GROQ_API_KEY"] = "gsk_fake_test_key"
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    class FakeGraphitiBrokenSearch:
+        def __init__(self, llm_client, embedder, graph_driver, cross_encoder=None):
+            pass
+
+        async def build_indices_and_constraints(self):
+            pass
+
+        async def search(self, query, group_ids=None, num_results=10):
+            raise RuntimeError("Neo4j unreachable")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("graphiti_core.Graphiti", FakeGraphitiBrokenSearch)
+
+    from app.memory.graphiti_adapter import search_cross_customer_relations
+    assert search_cross_customer_relations("anything") == []
+
+
+def test_search_cross_customer_relations_returns_empty_without_groq_key():
+    os.environ.pop("GROQ_API_KEY", None)
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    from app.memory.graphiti_adapter import search_cross_customer_relations
+    assert search_cross_customer_relations("anything") == []
+
+
+def test_find_related_fraud_signals_converts_neo4j_datetime_to_json_safe_string(monkeypatch):
+    """Regression test for a REAL bug found only against a live Neo4j
+    Aura instance, not this sandbox's own mocked tests (which
+    previously used a plain string for flagged_at and so never
+    exercised this path): the neo4j Python driver returns its OWN
+    temporal type (neo4j.time.DateTime) for a Cypher-returned
+    timestamp, not a stdlib datetime - and it is not JSON-serializable.
+    This crashed the whole aggregate_node commit (AuditLogEntry.detail
+    being a JSON column) AFTER the fraud check had already correctly
+    found a real cross-customer match. This test uses the REAL
+    neo4j.time.DateTime class, not a fake stand-in, so it fails again
+    immediately if the conversion is ever removed."""
+    import json
+    from neo4j.time import DateTime as Neo4jDateTime
+
+    os.environ["GROQ_API_KEY"] = "gsk_fake_test_key"
+    os.environ["NEO4J_URI"] = "neo4j+s://fake-instance.databases.neo4j.io"
+    os.environ["NEO4J_PASSWORD"] = "fake_password"
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    real_neo4j_datetime = Neo4jDateTime(2026, 9, 19, 5, 26, 34, 270228000)
+
+    class FakeRecord(dict):
+        def __getitem__(self, key):
+            return dict.__getitem__(self, key)
+
+    class FakeEagerResult:
+        def __init__(self, records):
+            self.records = records
+
+    class FakeNeo4jDriverRealDatetime:
+        def __init__(self, uri, user, password, database):
+            pass
+
+        async def execute_query(self, cypher_query_, params=None):
+            return FakeEagerResult([
+                FakeRecord(other_customer_id="CUST-OTHER", fraud_episode_uuid="ep-1",
+                           flagged_at=real_neo4j_datetime),
+            ])
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("graphiti_core.driver.neo4j_driver.Neo4jDriver", FakeNeo4jDriverRealDatetime)
+
+    from app.memory.graphiti_adapter import find_related_fraud_signals
+    result = find_related_fraud_signals("fp_abc123", exclude_customer_id="CUST-1")
+
+    assert len(result) == 1
+    assert isinstance(result[0]["flagged_at"], str), (
+        "flagged_at must be converted to a plain string - a raw neo4j.time.DateTime "
+        "object here is exactly what crashed AuditLogEntry.detail's JSON serialization"
+    )
+    json.dumps(result)  # must not raise - this is the actual failure mode found in production
+
+
+# --- Redundant build_indices_and_constraints() call, found and removed ----
+#
+# Real bug found against a live deployment: a genuine 30s Graphiti
+# timeout on log_episode(), traced to firing 31 separate Neo4j index/
+# constraint queries TWICE per call (62 total) - once automatically via
+# Neo4jDriver.__init__'s own background _init_task (confirmed by
+# reading its actual source: it schedules build_indices_and_constraints()
+# on construction), and once again via this project's own now-removed
+# explicit call, immediately after _wait_for_neo4j_driver_init already
+# awaited the first one. Graphiti's own docstring for
+# build_indices_and_constraints says it "should typically be called
+# once during initial setup" - not on every episode write.
+
+def test_add_episode_does_not_redundantly_call_build_indices_and_constraints(monkeypatch):
+    """The actual regression test: proves add_episode() no longer calls
+    build_indices_and_constraints() a second time - the driver's own
+    background _init_task (awaited via _wait_for_neo4j_driver_init) is
+    the only place this runs now."""
+    os.environ["GROQ_API_KEY"] = "gsk_fake_test_key"
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    call_count = {"n": 0}
+
+    class FakeGraphitiTracksIndexCalls:
+        def __init__(self, llm_client, embedder, graph_driver, cross_encoder=None):
+            pass
+
+        async def build_indices_and_constraints(self):
+            call_count["n"] += 1
+
+        async def add_episode(self, **kwargs):
+            pass
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("graphiti_core.Graphiti", FakeGraphitiTracksIndexCalls)
+
+    import app.memory.graphiti_adapter as ga
+    from datetime import datetime, timezone
+    ga.log_episode_graphiti("CUST-INDEX-TEST", "case_resolved", {"n": 1},
+                             occurred_at=datetime(2025, 6, 1, tzinfo=timezone.utc))
+
+    assert call_count["n"] == 0, (
+        "add_episode() must not call build_indices_and_constraints() itself - "
+        "the driver's own background _init_task already does this on construction"
+    )

@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db, ExceptionCase, AuditLogEntry, CaseState
+from app.core.auth import require_readonly, require_cs_agent, require_service, require_roles
 
 router = APIRouter(prefix="/cases", tags=["cases"])
 
@@ -31,9 +32,11 @@ class CaseResponse(BaseModel):
     diagnosis: dict | None = None
     fraud_risk_score: float | None = None
     fraud_flag: str | None = None
+    fraud_reasons: list | None = None
     resolution_decision: dict | None = None
     execution_result: dict | None = None
     verification_result: dict | None = None
+    working_memory_summary: dict | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -41,7 +44,8 @@ class CaseResponse(BaseModel):
 
 
 @router.post("", response_model=CaseResponse, status_code=201)
-def create_case(payload: CaseCreateRequest, db: Session = Depends(get_db)):
+def create_case(payload: CaseCreateRequest, db: Session = Depends(get_db),
+                 _auth=Depends(require_roles("service", "cs_agent"))):
     """Manual case creation, for testing. In production this is called
     internally by the webhook handlers (Phase 12), never directly by a client."""
     case = ExceptionCase(
@@ -67,7 +71,7 @@ def create_case(payload: CaseCreateRequest, db: Session = Depends(get_db)):
 
 
 @router.get("/{case_id}", response_model=CaseResponse)
-def get_case(case_id: str, db: Session = Depends(get_db)):
+def get_case(case_id: str, db: Session = Depends(get_db), _auth=Depends(require_readonly)):
     case = db.get(ExceptionCase, case_id)
     if not case:
         raise HTTPException(status_code=404, detail="case not found")
@@ -75,7 +79,8 @@ def get_case(case_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("", response_model=list[CaseResponse])
-def list_cases(exception_type: str = None, state: str = None, db: Session = Depends(get_db)):
+def list_cases(exception_type: str = None, state: str = None, db: Session = Depends(get_db),
+                _auth=Depends(require_readonly)):
     """Optional filters, added directly in response to "I want to view
     all case types in the UI" — this endpoint previously took zero
     query parameters at all, always returning every case regardless of
@@ -90,7 +95,7 @@ def list_cases(exception_type: str = None, state: str = None, db: Session = Depe
 
 
 @router.get("/meta/exception-types")
-def list_exception_types_seen(db: Session = Depends(get_db)):
+def list_exception_types_seen(db: Session = Depends(get_db), _auth=Depends(require_readonly)):
     """Every exception_type value that ACTUALLY exists in the database
     right now — not a hardcoded list of documented-but-possibly-unused
     values (the API schema documents payment/inventory/carrier/return/
@@ -103,7 +108,8 @@ def list_exception_types_seen(db: Session = Depends(get_db)):
 
 
 @router.post("/{case_id}/reopen", response_model=CaseResponse)
-def reopen_case(case_id: str, reason: str = "customer follow-up", db: Session = Depends(get_db)):
+def reopen_case(case_id: str, reason: str = "customer follow-up", db: Session = Depends(get_db),
+                 _auth=Depends(require_cs_agent)):
     """Explicit reopen path — edge case 6.3: a case reopened after
     'resolved' preserves the audit trail rather than spawning a duplicate
     case. Only RESOLVED cases can be reopened; a case that's still active

@@ -66,21 +66,48 @@ def test_log_episode_failure_produces_a_real_alert_not_just_a_log_line(isolated_
         cited_policy=CitedPolicy(doc_id="RET-POLICY-2025-A", version="1", clause_summary="return window"),
     )
 
-    import app.agents.resolution_completion as rc_module
+    import app.memory.episodic as episodic_module
 
     def always_fails(*args, **kwargs):
         raise ValueError("simulated real Pydantic validation error: Field required: summaries")
 
-    original_log_episode = rc_module.log_episode
-    rc_module.log_episode = always_fails
+    # Injected at the REAL failure point now, not resolution_completion.py's
+    # own call site: since log_episode_async() only enqueues (rarely
+    # fails itself - that would mean e.g. Redis unreachable), the
+    # interesting failure - the actual write - now happens inside
+    # app/workers/handlers.py's handle_log_episode(), on the job
+    # queue's worker thread, via its own call to
+    # app.memory.episodic.log_episode(). Patching that module-level
+    # name is what handle_log_episode() actually calls (it does `from
+    # app.memory.episodic import log_episode` INSIDE the function, at
+    # call time - so patching the module attribute here is seen).
+    original_log_episode = episodic_module.log_episode
+    episodic_module.log_episode = always_fails
     try:
         result = complete_resolution(
             db, case=case, proposed_decision=decision, final_decision=decision,
             decided_by="system:test", action_label="test_action",
             payment_intent_id="pi_log_episode_alert_test",
         )
+
+        # The write now happens asynchronously on the job queue's worker
+        # thread (this project's InProcessJobQueue, since no REDIS_URL is
+        # configured in tests) - complete_resolution() itself only
+        # enqueues and returns immediately. Poll briefly for the
+        # deferred failure (and its alert) to actually land, same
+        # "ack fast, process async" pattern tests/test_phase12_api.py's
+        # webhook tests already use for this project's other jobs.
+        import time
+        from app.core.alerting import get_recent_alerts
+        deadline = time.monotonic() + 2.0
+        alerts = []
+        while time.monotonic() < deadline:
+            alerts = get_recent_alerts(db, event_type="log_episode_failure")
+            if alerts:
+                break
+            time.sleep(0.01)
     finally:
-        rc_module.log_episode = original_log_episode
+        episodic_module.log_episode = original_log_episode
 
     # The case must still resolve correctly - non-fatal, matching the
     # existing, correct behavior.

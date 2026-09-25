@@ -221,9 +221,27 @@ def test_auto_execute_completion_writes_a_customer_history_episode(isolated_db):
         auto_execute_value_ceiling_usd=50.0, payment_intent_id="pi_fullpipe_2",
     )
 
-    history_after = get_customer_history(db, "CUST-FULLPIPE-2")
+    # The write now happens asynchronously via the job queue (memory-
+    # upgrade follow-up moving log_episode() off the resolution hot
+    # path - see app/workers/handlers.py's handle_log_episode()), not
+    # synchronously inline within run_full_case_pipeline() - found as a
+    # real failure against this exact test on a genuine run (not just
+    # in this sandbox), since a fixed immediate assertion here is
+    # inherently racy against the async write. Polls briefly, same
+    # "ack fast, process async" pattern tests/test_phase12_api.py's
+    # webhook tests and tests/test_async_episode_writes.py already use.
+    import time
+    deadline = time.monotonic() + 2.0
+    history_after = []
+    while time.monotonic() < deadline:
+        history_after = get_customer_history(db, "CUST-FULLPIPE-2")
+        if history_after:
+            break
+        time.sleep(0.01)
+
     assert len(history_after) == 1, (
-        "log_episode() must have been called during auto-execute completion"
+        "log_episode_async() must have enqueued a write during auto-execute completion, "
+        "and the job queue's worker must have actually processed it within 2s"
     )
     assert history_after[0]["episode_type"] == "case_resolved"
     assert history_after[0]["content"]["exception_type"] == "payment"

@@ -85,3 +85,39 @@ def test_startup_ensure_collection_failure_does_not_crash_the_app(isolated_env, 
     with TestClient(app) as client:
         resp = client.get("/api/v1/health")
         assert resp.status_code == 200, "app must still start and serve requests even if ensure_collection fails at startup"
+
+
+def test_ensure_collection_creates_a_doc_id_index(isolated_env, monkeypatch):
+    """THE regression test for a real, confirmed production bug: a
+    real user's actual Qdrant Cloud instance rejected policy-document
+    deletion outright with a 400 - "Index required but not found for
+    'doc_id'". delete_nodes_by_doc_id (and the count-before-delete
+    check in delete_policy) both filter on doc_id, and Qdrant's
+    server/cloud mode requires an explicit payload index to filter on
+    ANY field at all. 'doc_id' had simply never been added to
+    ensure_collection's index list - a real gap this project's own
+    test suite never caught, because the local embedded Qdrant this
+    suite runs against does not enforce the requirement at all (see
+    this file's own earlier docstring on that same limitation).
+
+    Verifying the actual index STATE isn't possible here for the exact
+    same reason documented above - this proves the CALL is made with
+    'doc_id' specifically, the correct, backend-agnostic claim to
+    test, which is what was actually missing and caused the real
+    failure."""
+    from app.rag.vectorstore import get_qdrant_client, ensure_collection
+
+    indexed_fields = []
+
+    def fake_create_payload_index(collection_name, field_name, field_schema):
+        indexed_fields.append(field_name)
+
+    client = get_qdrant_client()
+    monkeypatch.setattr(client, "create_payload_index", fake_create_payload_index)
+
+    ensure_collection(client, "test_doc_id_index_check", dim=4)
+
+    assert "doc_id" in indexed_fields, (
+        "doc_id must be indexed - without this, filtering on doc_id (used by policy "
+        "document deletion) fails outright against real Qdrant Cloud/server mode"
+    )
